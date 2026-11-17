@@ -12,7 +12,7 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-go@v6
@@ -21,7 +21,18 @@ jobs:
       - name: gofmt
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - run: go vet ./...
-      - run: go test -race ./...
+      - run: go run honnef.co/go/tools/cmd/staticcheck@2026.2.2 ./...
+      # The tests start this image; its binary is also the clickhouse-client the end-to-end tests drive.
+      - name: clickhouse-client
+        run: |
+          docker pull clickhouse/clickhouse-server:26.6
+          id=$(docker create clickhouse/clickhouse-server:26.6)
+          mkdir -p "$RUNNER_TEMP/bin"
+          docker cp "$id:/usr/bin/clickhouse" "$RUNNER_TEMP/bin/clickhouse"
+          docker rm "$id"
+          ln -s clickhouse "$RUNNER_TEMP/bin/clickhouse-client"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - run: go test -race -count=1 ./...
 
   image:
     name: Image builds
@@ -37,3 +48,11 @@ jobs:
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: chauth:ci
+          cache-from: type=gha
+      - name: lint the examples with the image
+        run: docker run --rm -v "$PWD/examples:/examples:ro" chauth:ci lint --config /examples/config.yaml /examples/rbac

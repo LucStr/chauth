@@ -64,7 +64,7 @@ jobs:
             cp LICENSE NOTICE README.md "$dir/"
             tar -czf "dist/$dir.tar.gz" "$dir"
           done
-          (cd dist && sha256sum *.tar.gz > checksums.txt)
+          (cd dist && sha256sum -- *.tar.gz > checksums.txt)
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
