@@ -1,0 +1,7 @@
+chauth
+Copyright 2026 The chauth Authors
+
+This product includes code derived from pgauth (https://github.com/LucStr/pgauth),
+licensed under the Apache License, Version 2.0: token verification, the role and
+role-binding format with its loader and lint, the connector's browser login, keychain,
+token file and service install, and the telemetry setup.

@@ -1,0 +1,4 @@
+/chauth
+/dist/
+*.test
+*.out
