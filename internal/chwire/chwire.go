@@ -1,6 +1,5 @@
-// Package chwire reads and writes the few ClickHouse native-protocol packets chauth looks at: the
-// client Hello, which carries the token, and the server's first reply. Everything after the Hello
-// is copied as bytes and never decoded.
+// Package chwire reads and writes the only native packets chauth looks at: the client Hello, which
+// carries the token, and the server's first reply; everything after is copied, never decoded.
 package chwire
 
 import (

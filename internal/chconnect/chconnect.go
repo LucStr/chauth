@@ -1,6 +1,5 @@
-// Package chconnect is chauth's connector: it serves ClickHouse clients on localhost, picks the
-// environment from the database name and forwards native and HTTP traffic to chauth serve with
-// the environment's token.
+// Package chconnect is chauth's connector: it serves ClickHouse clients on localhost and forwards
+// to the chauth serve the database name picks, with that environment's token.
 package chconnect
 
 import (

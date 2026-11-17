@@ -1,6 +1,5 @@
-// Package rbac reads role and role-binding resources (ChRole/ChRoleBinding) and answers which
-// access level a user has on a database. Parsing takes bytes, so a directory, a
-// ConfigMap or a CRD watch can all feed it.
+// Package rbac reads ChRole/ChRoleBinding resources from bytes, so a directory, a ConfigMap or a
+// CRD watch can feed it, and answers what a holder reaches on an instance.
 package rbac
 
 import (

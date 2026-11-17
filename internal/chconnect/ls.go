@@ -50,9 +50,8 @@ func (e *Env) Address(d *chapi.Discovery, instance, db string) string {
 	return e.Name + "/" + instance + "/" + db
 }
 
-// PrintAccess writes what each named environment's token reaches to out, databases first, then named
-// roles, and per-environment failures to errOut; an environment with nothing reachable gets the
-// server's access help.
+// PrintAccess writes what each environment's token reaches to out, databases then named roles, and
+// failures to errOut; an environment with nothing reachable gets the server's access help.
 func (c *Connector) PrintAccess(ctx context.Context, out, errOut io.Writer, names []string) error {
 	w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(w, "DATABASE\tLEVEL")

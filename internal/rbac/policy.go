@@ -21,9 +21,8 @@ type Instances map[string][]string
 
 var generatedRole = regexp.MustCompile(`\.(read|write)$`)
 
-// Compile adds the built-in roles and checks the resources as a whole: duplicate names, role
-// references, and grants against instances and, for named-role grants, against the roles
-// allowlist. With nil instances it skips every instance and role check.
+// Compile adds the built-in roles and checks names, role references, and grants against instances
+// and the roles allowlist; with nil instances it skips every instance and role check.
 func Compile(res *Resources, instances, roles Instances) (*Policy, Errors) {
 	var errs Errors
 	p := &Policy{roles: map[string]*Role{}}

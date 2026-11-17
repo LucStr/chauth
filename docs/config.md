@@ -83,13 +83,65 @@ several instances are configured). The connector takes `<env>/<db>`, strips `<en
 the rest. On a listener bound to an environment, a name without a known `<env>/` prefix, the empty
 one included, is in that environment ([ADR 0005](adr/0005-no-default-environment.md)).
 
+## Upstream setup
+
+[`examples/clickhouse-setup.sql`](../examples/clickhouse-setup.sql) creates the roles and the admin
+login for two databases, the read-only database `system` and one named role; the tests run it as is
+and the README shows it verbatim, so its admin grants are the complete set chauth needs. The admin
+needs no `ALTER USER`, no `KILL QUERY`, no row policy and no direct grants.
+
+## Discovery and access
+
+serve's HTTPS port answers three requests of its own; every other path is proxied to ClickHouse.
+`GET /ping` answers `Ok.` without a token.
+
+`GET /.well-known/chauth`, no authentication: what a connector needs to log in and to list targets.
+`native` and `http` are the request's host with the listen ports.
+
+```json
+{"native": "chauth.example.com:9440", "http": "https://chauth.example.com:8443",
+ "issuer": "https://auth.example.com/", "audience": "https://clickhouse.example.com",
+ "scopes": {"read": "clickhouse:read", "write": "clickhouse:write"},
+ "instances": [{"name": "main", "databases": ["core", "otel", "system"], "roles": ["chauth_querylog_read"]}],
+ "access_help": "Ask for access at https://access.example.com."}
+```
+
+`GET /v1/access` with `Authorization: Bearer <token>`: what this token reaches after the scope cap
+and the read-only cap, one entry per instance with anything reachable (`[]` when nothing is; 401 with
+`{"error": ...}` for a refused token).
+
+```json
+[{"instance": "main", "level": "write",
+  "databases": [{"database": "core", "level": "write"}, {"database": "system", "level": "read"}],
+  "roles": ["chauth_querylog_read"]}]
+```
+
+`level` is the temp user's level on that instance: `write` when any database or named role is
+reached at write, else `read` (the temp user then has `readonly = 2`). `chauth ls` prints these
+entries as a database table followed by the named roles. The types are `internal/chapi`.
+
+## Errors
+
+Both serve and the connector answer a refusal the way ClickHouse does: on native one Exception packet
+named `DB::Exception`, on HTTP a status with `X-ClickHouse-Exception-Code`. Code 516 is never sent,
+because `clickhouse-client` answers it with a password prompt.
+
+| Code | Meaning | HTTP status |
+| --- | --- | --- |
+| 497 `ACCESS_DENIED` | token missing, refused or expired; no binding; no scope | 401, or 403 for a valid token |
+| 81 `UNKNOWN_DATABASE` | unknown environment, instance or database | 400 |
+| 210 `NETWORK_ERROR` | upstream or serve unreachable, temp user not created | 502 / 503 |
+| 202 `TOO_MANY_SIMULTANEOUS_QUERIES` | `maxConnectionsPerUser` reached | 429 |
+| 101 `UNEXPECTED_PACKET_FROM_CLIENT` | the connector got something other than a Hello | (native only) |
+
 ## Connect config
 
 `chauth connect` reads `--config`, else `$CHAUTH_CONFIG`, else `<user config dir>/chauth/connect.yaml`;
 example: [`examples/connect.yaml`](../examples/connect.yaml).
 
 - `environments.<env>.server`: serve's native `host:port`; `httpServer`: serve's `https://` URL,
-  which also answers `GET /.well-known/chauth` and `GET /v1/access` (used by `chauth ls`);
+  which also answers `GET /.well-known/chauth` and `GET /v1/access` (used by `chauth ls`, see
+  [above](#discovery-and-access));
   `serverCA`: a PEM file to trust instead of the system roots (also top-level for every environment).
 - `environments.<env>.token`: `login: browser` with `issuer`, `clientId`, `resource`, `scope`
   (refresh token in the OS keychain under `chauth`), or `file`, `field`, `statusFile` (re-read on

@@ -124,9 +124,8 @@ func (s *Server) handleNative(raw net.Conn) {
 		"protocol", a.protocol, "reason", reason, "duration_ms", time.Since(start).Milliseconds(), "bytes_in", in2up, "bytes_out", up2in)
 }
 
-// dialNative logs in upstream with the client's Hello as lease and returns once the server Hello is
-// next on the reader. An upstream Exception is returned with its code and never relayed: it names
-// the temp user.
+// dialNative logs in upstream as lease and returns once the server Hello is next on the reader. An
+// upstream Exception is returned with its code and never relayed: it names the temp user.
 func (s *Server) dialNative(ctx context.Context, in *instance, h chwire.Hello, lease *chusers.Lease, db string) (net.Conn, *bufio.Reader, int32, error) {
 	host, _, err := net.SplitHostPort(in.cfg.Native)
 	if err != nil {
@@ -192,9 +191,8 @@ func (s *Server) refuse(conn *tls.Conn, br *bufio.Reader, code int32, msg string
 	_, _ = io.Copy(io.Discard, io.LimitReader(br, 1<<20))
 }
 
-// splice copies bytes both ways until either side closes, maxAge passes or stop closes, and returns
-// the bytes copied client to upstream and back, and why it ended. The readers hold what was read
-// past the Hello.
+// splice copies bytes both ways until a side closes, maxAge passes or stop closes, and returns the
+// bytes copied client→upstream and back and why it ended; the readers hold what followed the Hello.
 func splice(client net.Conn, clientR io.Reader, upstream net.Conn, upstreamR io.Reader, maxAge time.Duration, stop <-chan struct{}) (in, out int64, reason string) {
 	done := make(chan string, 2)
 	go func() {

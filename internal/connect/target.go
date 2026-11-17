@@ -6,9 +6,8 @@ import (
 	"strings"
 )
 
-// SplitTarget splits a chauth address into its environment and the rest serve resolves. A known
-// "<env>/" prefix always wins; otherwise the whole target, empty included, belongs to defaultEnv,
-// and without one it is refused.
+// SplitTarget splits an address into its environment and the rest serve resolves. A known "<env>/"
+// prefix wins; otherwise the whole target, empty included, is defaultEnv's, or refused without one.
 func SplitTarget(target, defaultEnv string, envs []string) (env, rest string, err error) {
 	if head, tail, ok := strings.Cut(target, "/"); ok && slices.Contains(envs, head) {
 		return head, tail, nil

@@ -37,7 +37,7 @@ type OIDC struct {
 	GroupsPrefix  string `json:"groupsPrefix"`
 	Scopes        Scopes `json:"scopes"`
 	ClientIDClaim string `json:"clientIdClaim"`
-	// AllowedClients restricts the client a token was issued to; empty allows any.
+	// AllowedClients are the clients whose tokens are accepted; serve's config requires at least one.
 	AllowedClients []string `json:"allowedClients"`
 }
 

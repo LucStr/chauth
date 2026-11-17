@@ -83,9 +83,13 @@ docker run -v /etc/chauth:/etc/chauth -p 9440:9440 -p 8443:8443 -p 8080:8080 \
 ```
 
 The image runs as non-root and needs no writable filesystem. `GET :8080/healthz` answers while the
-process runs, `GET :8080/readyz` once the issuer's keys and a valid rules set are loaded. On the
-HTTPS port, `GET /.well-known/chauth` publishes the addresses, issuer, client and scopes for
-connectors, and `GET /v1/access` with a bearer token lists what that token reaches. With the
+process runs, `GET :8080/readyz` once the issuer's keys and a valid rules set are loaded and every
+instance accepts the admin login. On the HTTPS port, `GET /.well-known/chauth` publishes the
+addresses, issuer, audience, scopes and instances for connectors, `GET /v1/access` with a bearer
+token lists what that token reaches, and `GET /ping` answers `Ok.` without a token
+([shapes](docs/config.md#discovery-and-access)). Every native connection logs a `connect` line when
+it is decided and a `disconnect` line with its duration and bytes when it closes; every HTTP request
+logs one `connect` line when it ends. With the
 standard `OTEL_EXPORTER_OTLP_*` variables set, spans, metrics and logs go out over OTLP with
 `service.name=chauth`; every log line also goes to stdout as JSON.
 
@@ -178,7 +182,7 @@ config: [`docs/config.md`](docs/config.md).
   stops new connections and HTTP requests at once; an open native connection runs until it closes or
   is cut at `maxConnectionAge`.
 - Clients cannot change what they are: chauth refuses the interserver and SSH-key login markers,
-  removes every client credential and `quota_key` on HTTP, refuses HTTP sessions, and sets
+  removes every client credential and `quota_key` on HTTP, and sets
   `log_comment` and `readonly` as `CONST` settings of the temp user.
 - Before a token is accepted, a client may send at most `preAuthMaxBytes` (64 KiB) within
   `handshakeTimeout` (30 s). Upstream TLS is always verified (`verify-full`, or `verify-ca`).
