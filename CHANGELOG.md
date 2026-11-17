@@ -9,8 +9,15 @@
   ClickHouse Cloud's default rules.
 - serve is ready only after a self-test per instance: create a temp user the way real ones are made,
   grant it every role the instance can hand out, log in as it and drop it. It repeats every
-  `limits.selfTestInterval` (10m); a failure makes the instance not ready and logs the failed step and
-  ClickHouse's error once. Metrics `chauth.selftest.ok` and `chauth.selftest.time`.
+  `limits.selfTestInterval` (10m); once ready, an instance turns not ready only after 3 failed checks
+  in a row and is ready again after one pass, logging each change once with the failed step and
+  ClickHouse's error. Metrics `chauth.selftest.ok`, `chauth.selftest.time` and `chauth.selftest.runs`.
+
+Upgrading from v0.1.0: the self-test grants every role an instance can hand out, so every database
+in `databases` needs both its read and its write role upstream, held by the admin `WITH ADMIN
+OPTION`, or must be listed in `readOnlyDatabases`. A deployment that created only the read role for
+some database must add it to `readOnlyDatabases` or create its write role before upgrading;
+otherwise the instance never becomes ready and the log names the missing role.
 - `examples/clickhouse-setup.sql`: the example admin password meets the same rules.
 
 ## v0.1.0 (2026-11-17)
