@@ -145,6 +145,15 @@ because `clickhouse-client` answers it with a password prompt.
 | 202 `TOO_MANY_SIMULTANEOUS_QUERIES` | `maxConnectionsPerUser` reached | 429 |
 | 101 `UNEXPECTED_PACKET_FROM_CLIENT` | the connector got something other than a Hello | (native only) |
 
+## Shutdown
+
+On SIGTERM or SIGINT serve stops accepting on both ports, lets running HTTP requests finish for
+`limits.shutdownGrace` (10 s), then cuts every remaining native and HTTP connection, cancels the
+upstream queries of cut HTTP requests, and drops the temp users this process created within another
+10 s before it exits. A deployment's termination grace period (Kubernetes: 30 s by default) must
+exceed `shutdownGrace` + 10 s, or the process is killed before it drops its temp users; the sweep of
+another instance drops them only once their `VALID UNTIL` has passed.
+
 ## Connect config
 
 `chauth connect` reads `--config`, else `$CHAUTH_CONFIG`, else `<user config dir>/chauth/connect.yaml`;

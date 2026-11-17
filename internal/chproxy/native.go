@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/LucStr/chauth/internal/chusers"
@@ -30,31 +31,43 @@ func (f *failure) nativeCode() int32 {
 }
 
 // ServeNative accepts native connections on ln, which must not be a TLS listener: TLS is done per
-// connection under the handshake deadline. It returns after ctx ends and every connection closed.
+// connection under the handshake deadline. It stops accepting when ctx ends and returns once every
+// connection closed; Stop cuts them.
 func (s *Server) ServeNative(ctx context.Context, ln net.Listener) error {
 	go func() {
-		<-ctx.Done()
-		s.Stop()
+		select {
+		case <-ctx.Done():
+		case <-s.stopping:
+		}
 		ln.Close()
 	}()
 	defer s.conns.Wait()
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || s.stopped() {
 				return nil
 			}
 			return err
 		}
+		release, ok := s.preAuth.take(conn.RemoteAddr())
+		if !ok || !s.track(conn) {
+			conn.Close()
+			release()
+			continue
+		}
 		s.conns.Add(1)
 		go func() {
 			defer s.conns.Done()
-			s.handleNative(conn)
+			defer s.untrack(conn)
+			defer release()
+			s.handleNative(conn, release)
 		}()
 	}
 }
 
-func (s *Server) handleNative(raw net.Conn) {
+// handleNative serves one connection; verified releases its pre-auth slot once the token is verified.
+func (s *Server) handleNative(raw net.Conn, verified func()) {
 	defer raw.Close()
 	_ = raw.SetDeadline(time.Now().Add(time.Duration(s.cfg.Limits.HandshakeTimeout)))
 	conn := tls.Server(raw, s.tls)
@@ -77,6 +90,9 @@ func (s *Server) handleNative(raw net.Conn) {
 		return
 	}
 	in, d, f := s.decide(ctx, hello.Password, hello.Database, a)
+	if d.Claims.Subject != "" {
+		verified()
+	}
 	if f != nil {
 		finish("deny", f.msg)
 		s.refuse(conn, br, f.nativeCode(), f.msg)
@@ -220,4 +236,38 @@ func splice(client net.Conn, clientR io.Reader, upstream net.Conn, upstreamR io.
 		<-done
 	}
 	return in, out, reason
+}
+
+// preAuth counts native connections that have not yet verified a token, in total and per address.
+type preAuth struct {
+	max, maxPerIP int
+	mu            sync.Mutex
+	total         int
+	perIP         map[string]int
+}
+
+// take reserves a slot for a connection from addr; release is idempotent.
+func (p *preAuth) take(addr net.Addr) (release func(), ok bool) {
+	ip := addr.String()
+	if tcp, isTCP := addr.(*net.TCPAddr); isTCP {
+		ip = tcp.IP.String()
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.total >= p.max || p.maxPerIP > 0 && p.perIP[ip] >= p.maxPerIP {
+		return func() {}, false
+	}
+	p.total++
+	p.perIP[ip]++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			p.total--
+			if p.perIP[ip]--; p.perIP[ip] <= 0 {
+				delete(p.perIP, ip)
+			}
+		})
+	}, true
 }

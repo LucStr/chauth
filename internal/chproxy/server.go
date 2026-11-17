@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"slices"
@@ -39,6 +40,11 @@ type Server struct {
 	conns     sync.WaitGroup
 	stopping  chan struct{}
 	stopOnce  sync.Once
+	preAuth   *preAuth
+	// open are the native connections Stop closes; requests counts running HTTP handlers.
+	openMu   sync.Mutex
+	open     map[net.Conn]bool
+	requests sync.WaitGroup
 
 	userMu    sync.Mutex
 	userConns map[string]int
@@ -59,6 +65,8 @@ func New(cfg *chconfig.Config, verifier *token.Verifier, store *rbac.Store, tlsC
 		cfg: cfg, verifier: verifier, rbac: store, tls: tlsConfig, log: log,
 		tracer:    otel.Tracer("github.com/LucStr/chauth/internal/chproxy"),
 		instances: map[string]*instance{}, stopping: make(chan struct{}), userConns: map[string]int{},
+		preAuth: &preAuth{max: cfg.Limits.MaxPreAuthConnections, maxPerIP: cfg.Limits.MaxPreAuthConnectionsPerIP, perIP: map[string]int{}},
+		open:    map[net.Conn]bool{},
 	}
 	l := cfg.Limits
 	for _, in := range cfg.Instances {
@@ -136,8 +144,47 @@ func (s *Server) Ready(ctx context.Context) error {
 	return nil
 }
 
-// Stop cuts every open native connection; Serve returns once they are closed.
-func (s *Server) Stop() { s.stopOnce.Do(func() { close(s.stopping) }) }
+// Stop stops accepting native connections and cuts every open one; ServeNative returns once they
+// are closed.
+func (s *Server) Stop() {
+	s.stopOnce.Do(func() {
+		s.openMu.Lock()
+		close(s.stopping)
+		for c := range s.open {
+			c.Close()
+		}
+		s.openMu.Unlock()
+	})
+}
+
+func (s *Server) stopped() bool {
+	select {
+	case <-s.stopping:
+		return true
+	default:
+		return false
+	}
+}
+
+// track registers a native connection for Stop; false once stopping.
+func (s *Server) track(c net.Conn) bool {
+	s.openMu.Lock()
+	defer s.openMu.Unlock()
+	if s.stopped() {
+		return false
+	}
+	s.open[c] = true
+	return true
+}
+
+func (s *Server) untrack(c net.Conn) {
+	s.openMu.Lock()
+	delete(s.open, c)
+	s.openMu.Unlock()
+}
+
+// WaitRequests returns once every HTTP handler returned; call it after the HTTP server was closed.
+func (s *Server) WaitRequests() { s.requests.Wait() }
 
 // Close drops every temp user this process created; call it after the listeners stopped.
 func (s *Server) Close(ctx context.Context) {

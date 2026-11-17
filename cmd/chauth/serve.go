@@ -26,6 +26,9 @@ import (
 	"github.com/LucStr/chauth/internal/token"
 )
 
+// dropTimeout bounds dropping the temp users on shutdown, after the grace for running requests.
+const dropTimeout = 10 * time.Second
+
 func serve(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	path := fs.String("config", "/etc/chauth/config.yaml", "path to the config file")
@@ -52,8 +55,9 @@ func serve(args []string) error {
 	return runServe(ctx, cfg, verifier, store, log)
 }
 
-// runServe serves until ctx ends, then closes both listeners, cuts open connections and drops the
-// temp users this process created.
+// runServe serves until ctx ends, then stops accepting, lets running HTTP requests finish for
+// limits.shutdownGrace, cuts every remaining connection and drops this process's temp users within
+// dropTimeout.
 func runServe(ctx context.Context, cfg *chconfig.Config, verifier *token.Verifier, store *rbac.Store, log *slog.Logger) error {
 	certs := &certReloader{certFile: cfg.TLS.CertFile, keyFile: cfg.TLS.KeyFile}
 	if _, err := certs.get(nil); err != nil {
@@ -88,7 +92,7 @@ func runServe(ctx context.Context, cfg *chconfig.Config, verifier *token.Verifie
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		if err := hs.ServeTLS(httpLn, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := hs.ServeTLS(srv.LimitHTTP(httpLn), "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errs <- fmt.Errorf("https: %w", err)
 			cancel()
 		}
@@ -102,11 +106,17 @@ func runServe(ctx context.Context, cfg *chconfig.Config, verifier *token.Verifie
 	}()
 	log.Info("chauth listening", "native", cfg.Listen.Native, "http", cfg.Listen.HTTP, "version", version)
 	<-ctx.Done()
-	shutdownCtx, done := context.WithTimeout(context.Background(), 30*time.Second)
-	defer done()
-	_ = hs.Shutdown(shutdownCtx)
+	log.Info("chauth stopping", "grace", time.Duration(cfg.Limits.ShutdownGrace).String())
+	graceCtx, endGrace := context.WithTimeout(context.Background(), time.Duration(cfg.Limits.ShutdownGrace))
+	_ = hs.Shutdown(graceCtx)
+	endGrace()
+	_ = hs.Close()
+	srv.Stop()
 	wg.Wait()
-	srv.Close(shutdownCtx)
+	srv.WaitRequests()
+	dropCtx, dropped := context.WithTimeout(context.Background(), dropTimeout)
+	defer dropped()
+	srv.Close(dropCtx)
 	log.Info("chauth stopped")
 	select {
 	case err := <-errs:

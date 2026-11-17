@@ -125,6 +125,7 @@ accessHelp: Ask the data team.
 tls: {certFile: %s, keyFile: %s}
 oidc: {issuer: %s, audience: %s, allowedClients: [%s, %s]}
 rbac: {dir: %s, reloadInterval: 1s}
+limits: {shutdownGrace: 1s}
 instances:
   - name: main
     native: %s
@@ -494,3 +495,76 @@ type memStore map[string]string
 func (m memStore) Get(k string) (string, error) { return m[k], nil }
 func (m memStore) Set(k, v string) error        { m[k] = v; return nil }
 func (m memStore) Delete(k string) error        { delete(m, k); return nil }
+
+// TestShutdown stops serve while a long HTTP query and a long native query run through the
+// connector: after runServe returns, both queries are gone upstream and no temp user is left.
+func TestShutdown(t *testing.T) {
+	s := newStack(t)
+	cfg, err := chconfig.Load(s.serveConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	store, err := rbacStore(cfg, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	served := make(chan error, 1)
+	go func() { served <- runServe(ctx, cfg, token.NewVerifier(cfg.OIDC), store, log) }()
+	f, err := loadConnect(s.connectYAML)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cctx, ccancel := context.WithCancel(context.Background())
+	connected := make(chan error, 1)
+	go func() { connected <- runConnect(cctx, f, s.local, s.localHTTP, defaultCallbackPort, log) }()
+	defer func() { ccancel(); <-connected }()
+	s.waitReady(t)
+
+	id := "shutdown-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	go func() {
+		resp, err := http.Post("http://"+s.localHTTP+"/?database=prod/core&max_block_size=1&query_id="+id+"-http", "text/plain",
+			strings.NewReader("SELECT sleepEachRow(1) FROM numbers(120)"))
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+	}()
+	go func() {
+		c, err := clickhouse.Open(&clickhouse.Options{Addr: []string{s.local}, Auth: clickhouse.Auth{Database: "prod/core"}, MaxOpenConns: 1})
+		if err == nil {
+			defer c.Close()
+			_ = c.Exec(clickhouse.Context(context.Background(), clickhouse.WithQueryID(id+"-native")), "SELECT sleepEachRow(1) FROM numbers(120) SETTINGS max_block_size = 1")
+		}
+	}()
+	running := func() string {
+		n, _ := shared.Root("SELECT count() FROM system.processes WHERE query_id LIKE '" + id + "-%'")
+		return n
+	}
+	for deadline := time.Now().Add(15 * time.Second); running() != "2"; time.Sleep(100 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("queries not running: %s", running())
+		}
+	}
+	start := time.Now()
+	cancel()
+	if err := <-served; err != nil {
+		t.Fatal(err)
+	}
+	took := time.Since(start)
+	if n, err := shared.TempUsers(); err != nil || n != "0" {
+		t.Errorf("%s temp users left after shutdown (%v)", n, err)
+	}
+	// A native query ends when ClickHouse next checks the closed connection, within a block.
+	for deadline := time.Now().Add(3 * time.Second); running() != "0"; time.Sleep(100 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			ids, _ := shared.Root("SELECT groupArray(query_id) FROM system.processes WHERE query_id LIKE '" + id + "-%'")
+			t.Fatalf("upstream queries still running after shutdown: %s", ids)
+		}
+	}
+	if took > 12*time.Second {
+		t.Errorf("shutdown took %s", took)
+	}
+}

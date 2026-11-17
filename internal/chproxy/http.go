@@ -3,6 +3,8 @@ package chproxy
 import (
 	"bytes"
 	"cmp"
+	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -17,6 +19,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/net/netutil"
+
 	"github.com/LucStr/chauth/internal/chapi"
 	"github.com/LucStr/chauth/internal/chwire"
 	"github.com/LucStr/chauth/internal/rbac"
@@ -29,6 +33,12 @@ var (
 	strippedHeaders = []string{"Authorization", "X-ClickHouse-User", "X-ClickHouse-Key", "X-ClickHouse-Quota",
 		"X-ClickHouse-SSL-Certificate-Auth", "X-ClickHouse-Database"}
 )
+
+// LimitHTTP caps the open connections accepted from ln at limits.maxHTTPConnections; further
+// clients wait in the accept queue.
+func (s *Server) LimitHTTP(ln net.Listener) net.Listener {
+	return netutil.LimitListener(ln, s.cfg.Limits.MaxHTTPConnections)
+}
 
 // NewHTTPServer is the HTTPS server for Handler with the pre-auth limits applied; the caller sets
 // Addr or calls ServeTLS. There is no read or write timeout: bodies stream.
@@ -68,6 +78,8 @@ func (f *failure) httpStatus() int {
 }
 
 func (s *Server) proxyHTTP(w http.ResponseWriter, r *http.Request) {
+	s.requests.Add(1)
+	defer s.requests.Done()
 	ctx, finish, a := s.begin(r.Context(), "http")
 	sw := &statusWriter{ResponseWriter: w}
 	// fail answers f; reason, when set, is logged instead of f.msg.
@@ -105,6 +117,23 @@ func (s *Server) proxyHTTP(w http.ResponseWriter, r *http.Request) {
 	defer lease.Release()
 	a.tempUser = lease.User
 	query = chapi.AppendParam(query, "database", d.Database)
+	queryID := queryIDOf(query)
+	if queryID == "" {
+		queryID = "chauth-" + rand.Text()
+		query = chapi.AppendParam(query, "query_id", queryID)
+	}
+	completed := false
+	defer func() {
+		if completed {
+			return
+		}
+		// ClickHouse over HTTPS notices a gone client only when the query next writes.
+		kctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if err := in.admin.CancelQuery(kctx, lease.User, lease.Password, queryID); err != nil {
+			s.log.Warn("cancel the upstream query of a closed request", "temp_user", lease.User, "error", err)
+		}
+	}()
 
 	var upstreamErr error
 	rp := &httputil.ReverseProxy{
@@ -151,6 +180,16 @@ func (s *Server) proxyHTTP(w http.ResponseWriter, r *http.Request) {
 		finish("allow", "")
 	}()
 	rp.ServeHTTP(sw, r.WithContext(ctx))
+	completed = r.Context().Err() == nil && upstreamErr == nil
+}
+
+// queryIDOf is the query_id parameter of a raw query, "" when there is none.
+func queryIDOf(query string) string {
+	_, ids, err := chapi.FilterQuery(query, "query_id", func(string) bool { return false })
+	if err != nil || len(ids) == 0 {
+		return ""
+	}
+	return ids[len(ids)-1]
 }
 
 // hideLoginFailure replaces an upstream authentication error, which names the temp user.

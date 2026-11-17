@@ -73,6 +73,7 @@ type Manager struct {
 	current map[string]*entry // key id → the user new connections get
 	byName  map[string]*entry // every user this process created and has not dropped
 	retry   map[string]bool   // users whose drop failed
+	closed  bool
 
 	created, dropped, dropFailed metric.Int64Counter
 	live                         metric.Int64UpDownCounter
@@ -198,7 +199,7 @@ func (m *Manager) release(e *entry) {
 		done = true
 	default:
 	}
-	if done && e.err == nil && m.current[e.key] == e && time.Now().Before(e.leaseEnd) {
+	if done && e.err == nil && m.current[e.key] == e && time.Now().Before(e.leaseEnd) && !m.closed {
 		e.idle = time.AfterFunc(m.opts.IdleTTL, func() { m.dropIdle(e) })
 		m.mu.Unlock()
 		return
@@ -384,6 +385,7 @@ func (m *Manager) Run(ctx context.Context, interval time.Duration) {
 // Close drops every user this process created, in use or not; call it after the listeners closed.
 func (m *Manager) Close(ctx context.Context) {
 	m.mu.Lock()
+	m.closed = true
 	names := make([]string, 0, len(m.byName))
 	for name, e := range m.byName {
 		if e.idle != nil {
@@ -391,10 +393,11 @@ func (m *Manager) Close(ctx context.Context) {
 		}
 		select {
 		case <-e.ready:
-			if e.err == nil && !e.dropped {
-				names = append(names, name)
-			}
 		default:
+			continue // still being created: released after Close, it is dropped at once
+		}
+		if e.err == nil && !e.dropped {
+			names = append(names, name)
 		}
 		e.dropped = true
 		m.forget(e)

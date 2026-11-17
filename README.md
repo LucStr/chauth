@@ -189,7 +189,15 @@ config: [`docs/config.md`](docs/config.md).
   removes every client credential and `quota_key` on HTTP, and sets
   `log_comment` and `readonly` as `CONST` settings of the temp user.
 - Before a token is accepted, a client may send at most `preAuthMaxBytes` (64 KiB) within
-  `handshakeTimeout` (30 s). Upstream TLS is always verified (`verify-full`, or `verify-ca`).
+  `handshakeTimeout` (10 s), TLS handshake included; at most `maxPreAuthConnections` (512) native
+  connections may be in that state (optionally per address), and the HTTPS port holds at most
+  `maxHTTPConnections` (2048) connections. Upstream TLS is always verified (`verify-full`, or
+  `verify-ca`).
+- An HTTP request whose client goes away has its upstream query cancelled: serve gives every
+  forwarded request a `query_id` (keeping the client's) and replaces it, as the temp user, with an
+  empty query. On shutdown serve stops accepting, gives running HTTP requests `shutdownGrace` (10 s),
+  cuts the rest and drops its temp users within 10 s more; set the termination grace period above
+  `shutdownGrace` + 10 s ([shutdown](docs/config.md#shutdown)).
 - The admin user can grant or revoke its roles on any existing ClickHouse user; keep its credentials
   with chauth alone and limit it by `HOST IP`.
 - The connector listens only on loopback addresses and never runs a configured command: tokens come

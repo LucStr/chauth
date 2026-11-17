@@ -33,8 +33,12 @@ limits:
   sweepInterval: 1m            # how often expired temp users of any process are dropped
   maxConnectionsPerUser: 50    # open native connections plus running HTTP requests per subject
   maxConnectionsPerTempUser: 20
-  handshakeTimeout: 30s        # TLS plus Hello, or TLS plus request headers
+  handshakeTimeout: 10s        # TLS plus Hello, or TLS plus request headers
   preAuthMaxBytes: 65536       # bytes a client may send before its token is accepted
+  maxPreAuthConnections: 512   # native connections still before a verified token; more are closed at once
+  maxPreAuthConnectionsPerIP: 0   # the same per client address; 0 is off (keep it off behind an address-rewriting load balancer)
+  maxHTTPConnections: 2048     # open connections on the HTTPS port
+  shutdownGrace: 10s           # running HTTP requests may finish this long on SIGTERM; then +10s to drop temp users
 
 instances:
   - name: main                                     # required; grants and built-in roles use it

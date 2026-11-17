@@ -138,6 +138,7 @@ func start(t *testing.T, rules string, mutate func(*chconfig.Config)) *harness {
 
 func (h *harness) stop() {
 	h.cancel()
+	h.srv.Stop()
 	<-h.stopped
 	h.srv.Close(context.Background())
 }
@@ -1008,7 +1009,10 @@ func TestMixedCaseDatabase(t *testing.T) {
 		"CREATE ROLE chauth_Mixed_read", "GRANT SELECT ON Mixed.* TO chauth_Mixed_read", "GRANT chauth_Mixed_read TO chauth_admin WITH ADMIN OPTION"} {
 		mustRoot(t, stmt)
 	}
-	t.Cleanup(func() { mustRoot(t, "DROP ROLE IF EXISTS chauth_Mixed_read"); mustRoot(t, "DROP DATABASE IF EXISTS Mixed") })
+	t.Cleanup(func() {
+		mustRoot(t, "DROP ROLE IF EXISTS chauth_Mixed_read")
+		mustRoot(t, "DROP DATABASE IF EXISTS Mixed")
+	})
 	h := start(t, binding("mixed", "main.Mixed.read", user(chtest.User)), func(c *chconfig.Config) {
 		c.Instances[0].Databases = append(c.Instances[0].Databases, "Mixed")
 	})
@@ -1039,4 +1043,147 @@ func TestMixedCaseDatabase(t *testing.T) {
 	if strings.Contains(got, "Exception") {
 		t.Errorf("a statement failed:\n%s", got)
 	}
+}
+
+// TestHTTPClientGone: a client that disconnects mid-query cancels the upstream query, also when a
+// compressed answer has written nothing yet, so ClickHouse cannot notice the closed connection.
+func TestHTTPClientGone(t *testing.T) {
+	h := start(t, coreWrite, nil)
+	tests := []struct {
+		name, scope, encoding string
+	}{
+		{"read level, gzip", "clickhouse:read", "gzip"},
+		{"write level, gzip", "clickhouse:write", "gzip"},
+		{"write level, uncompressed", "clickhouse:write", "identity"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			id := "gone-" + rand.Text()
+			ctx, cancel := context.WithCancel(context.Background())
+			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, h.url+"/?database=core&max_block_size=1&query_id="+id, strings.NewReader("SELECT sleepEachRow(1) FROM numbers(60)"))
+			req.Header.Set("Authorization", "Bearer "+shared.Issuer.Token(chtest.Claims{Scope: tt.scope}))
+			req.Header.Set("Accept-Encoding", tt.encoding)
+			go func() {
+				if resp, err := httpClient().Do(req); err == nil {
+					_, _ = io.Copy(io.Discard, resp.Body)
+					resp.Body.Close()
+				}
+			}()
+			running := func() string { return mustRoot(t, "SELECT count() FROM system.processes WHERE query_id = '"+id+"'") }
+			waitFor(t, "query running", func() bool { return running() == "1" })
+			cancel()
+			waitFor(t, "query cancelled", func() bool { return running() == "0" })
+		})
+	}
+}
+
+// TestPreAuthCap: idle connections before a token use up maxPreAuthConnections, one more is closed
+// at once, and a connection whose token verified no longer counts.
+func TestPreAuthCap(t *testing.T) {
+	h := start(t, coreRead, func(c *chconfig.Config) { c.Limits.MaxPreAuthConnections = 2 })
+	tok := shared.Issuer.Token(chtest.Claims{})
+	ctx := context.Background()
+	idle := func() net.Conn {
+		t.Helper()
+		c, err := net.Dial("tcp", h.native)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	// closedAtOnce reads from c: a refused connection ends, an admitted idle one stays open.
+	closedAtOnce := func(c net.Conn) bool {
+		_ = c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		_, err := c.Read(make([]byte, 1))
+		var ne net.Error
+		return !(errors.As(err, &ne) && ne.Timeout())
+	}
+	held := func() int {
+		h.srv.preAuth.mu.Lock()
+		defer h.srv.preAuth.mu.Unlock()
+		return h.srv.preAuth.total
+	}
+	a, b := idle(), idle()
+	defer a.Close()
+	defer b.Close()
+	waitFor(t, "two pre-auth slots taken", func() bool { return held() == 2 })
+	over := idle()
+	defer over.Close()
+	if !closedAtOnce(over) {
+		t.Fatal("a connection over the cap was admitted")
+	}
+	if _, err := h.nativeOpen(ctx, "core", tok, nil); err == nil {
+		t.Fatal("a client got in while the cap was full")
+	}
+	a.Close()
+	waitFor(t, "slot freed", func() bool { return held() == 1 })
+	c, err := h.nativeOpen(ctx, "core", tok, nil)
+	if err != nil {
+		t.Fatalf("authenticated client after a slot freed: %v", err)
+	}
+	defer c.Close()
+	if held() != 1 {
+		t.Fatalf("%d pre-auth slots held, want 1: the verified connection must not count", held())
+	}
+	d := idle()
+	defer d.Close()
+	if closedAtOnce(d) {
+		t.Fatal("the verified connection still counts against the cap")
+	}
+	e := idle()
+	defer e.Close()
+	if !closedAtOnce(e) {
+		t.Fatal("third pre-auth connection admitted")
+	}
+}
+
+func TestPreAuthPerIP(t *testing.T) {
+	p := &preAuth{max: 10, maxPerIP: 1, perIP: map[string]int{}}
+	a := &net.TCPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 1}
+	b := &net.TCPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 2}
+	other := &net.TCPAddr{IP: net.IPv4(10, 0, 0, 2), Port: 1}
+	release, ok := p.take(a)
+	if _, ok2 := p.take(b); !ok || ok2 {
+		t.Fatalf("second connection from one address: first %v second %v", ok, ok2)
+	}
+	if _, ok := p.take(other); !ok {
+		t.Fatal("another address refused")
+	}
+	release()
+	release()
+	if _, ok := p.take(b); !ok || p.total != 2 {
+		t.Fatalf("after release: ok %v, total %d", ok, p.total)
+	}
+}
+
+// TestHTTPConnectionCap: with maxHTTPConnections open, the next client waits until one closes.
+func TestHTTPConnectionCap(t *testing.T) {
+	h := start(t, coreRead, func(c *chconfig.Config) { c.Limits.MaxHTTPConnections = 1 })
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hs := h.srv.NewHTTPServer()
+	go func() { _ = hs.ServeTLS(h.srv.LimitHTTP(ln), "", "") }()
+	defer hs.Close()
+	first, err := tls.Dial("tcp", ln.Addr().String(), shared.ClientTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	tc := tls.Client(second, shared.ClientTLS)
+	_ = second.SetDeadline(time.Now().Add(time.Second))
+	if err := tc.Handshake(); err == nil {
+		t.Fatal("second connection served while the cap was full")
+	}
+	first.Close()
+	third, err := tls.Dial("tcp", ln.Addr().String(), shared.ClientTLS)
+	if err != nil {
+		t.Fatalf("after the first closed: %v", err)
+	}
+	third.Close()
 }

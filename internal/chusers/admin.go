@@ -71,8 +71,23 @@ func (a *Admin) Login(ctx context.Context, user, password string) error {
 	return a.run(ctx, user, password, "SELECT 1", nil)
 }
 
+// CancelQuery stops user's running query queryID by replacing it with an empty one under the same
+// id; this needs no privilege, unlike KILL QUERY, which reads system.processes.
+func (a *Admin) CancelQuery(ctx context.Context, user, password, queryID string) error {
+	u, err := url.Parse(a.url)
+	if err != nil {
+		return err
+	}
+	u.RawQuery = url.Values{"replace_running_query": {"1"}, "query_id": {queryID}}.Encode()
+	return a.runURL(ctx, u.String(), user, password, "SELECT 1", nil)
+}
+
 func (a *Admin) run(ctx context.Context, user, password, stmt string, row func([]byte) error) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.url, strings.NewReader(stmt))
+	return a.runURL(ctx, a.url, user, password, stmt, row)
+}
+
+func (a *Admin) runURL(ctx context.Context, u, user, password, stmt string, row func([]byte) error) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(stmt))
 	if err != nil {
 		return err
 	}
