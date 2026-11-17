@@ -1,0 +1,52 @@
+# chauth serve --config <file>. Every value shown is the default unless marked required.
+listen:
+  native: ":9440"        # ClickHouse native protocol over TLS; the token is the Hello password
+  http: ":8443"          # HTTPS: proxied ClickHouse HTTP, plus GET /.well-known/chauth and GET /v1/access
+  health: ":8080"        # GET /healthz, /readyz; "" disables it
+accessHelp: "Ask for access at https://access.example.com."   # appended to every no-binding denial
+
+tls:                                   # required: the certificate both listeners present
+  certFile: /etc/chauth/tls/tls.crt
+  keyFile: /etc/chauth/tls/tls.key
+
+oidc:
+  issuer: https://auth.example.com/              # required
+  audience: https://clickhouse.example.com       # required
+  allowedClients: [example-cli, example-agent]   # required, non-empty: tokens of any other client are refused
+  usernameClaim: email
+  usernameCaseInsensitive: true
+  groupsClaim: groups
+  groupsPrefix: ""
+  scopes:
+    read: clickhouse:read      # caps access at read
+    write: clickhouse:write    # allows write where a binding grants it
+  clientIdClaim: client_id     # falls back to azp
+
+rbac:
+  dir: /etc/chauth/rbac        # required: ChRole / ChRoleBinding YAML, reread on change
+  reloadInterval: 10s
+
+limits:
+  maxConnectionAge: 12h        # a native connection is cut after this
+  leaseDuration: 6h            # default half of maxConnectionAge: how long one temp user is handed out
+  tempUserIdleTTL: 5m          # a temp user with no open connection is dropped after this
+  sweepInterval: 1m            # how often expired temp users of any process are dropped
+  maxConnectionsPerUser: 50    # open native connections plus running HTTP requests per subject
+  maxConnectionsPerTempUser: 20
+  handshakeTimeout: 30s        # TLS plus Hello, or TLS plus request headers
+  preAuthMaxBytes: 65536       # bytes a client may send before its token is accepted
+
+instances:
+  - name: main                                     # required; grants and built-in roles use it
+    native: clickhouse.example.com:9440           # required: upstream native TLS port
+    http: https://clickhouse.example.com:8443     # required: upstream HTTPS base URL
+    tlsMode: verify-full                           # or verify-ca (skips the host name check only)
+    # caFile: /etc/chauth/upstream-ca.pem          # default: system roots
+    # tlsServerName: clickhouse.internal           # default: the host of native / http
+    databases: [core, otel, system]                # required: each maps to <roleTemplate> per level
+    readOnlyDatabases: [system]                    # any grant, write and "*" included, gives only the read role here
+    roles: [chauth_querylog_read]                  # upstream roles a ChRole may grant by name
+    credentialsFile: /etc/chauth/credentials/main.json   # required: {"username": ..., "password": ...} of the admin user
+    tempUserPrefix: chauth_tmp_                    # the admin may create and drop only users with this prefix
+    tempUserHostIPs: [10.0.0.0/14]                 # HOST IP of every temp user; empty: any host
+    roleTemplate: "chauth_{database}_{level}"

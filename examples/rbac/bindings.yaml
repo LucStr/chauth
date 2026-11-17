@@ -1,0 +1,17 @@
+apiVersion: chauth.dev/v1alpha1
+kind: ChRoleBinding
+metadata:
+  name: viewers-analytics
+spec:
+  roleRef: {kind: ChRole, name: analytics-read}
+  subjects:
+    - {kind: Group, name: viewers}
+---
+apiVersion: chauth.dev/v1alpha1
+kind: ChRoleBinding
+metadata:
+  name: alice-core-write
+spec:
+  roleRef: {kind: ChRole, name: main.core.write}
+  subjects:
+    - {kind: User, name: alice@example.com}

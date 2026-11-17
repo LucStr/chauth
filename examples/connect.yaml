@@ -1,0 +1,24 @@
+# chauth connect: --config, else $CHAUTH_CONFIG, else <user config dir>/chauth/connect.yaml.
+listen: 127.0.0.1:9000          # native; clients name the database <env>/<db>
+listenHTTP: 127.0.0.1:8123      # HTTP; database=<env>/<db> or X-ClickHouse-Database
+callbackPort: 8250              # browser login redirect; 0 = any free port
+listeners:                      # bound ports: a database without "<env>/" (or none at all) is in env
+  - {listen: 127.0.0.1:9001, listenHTTP: 127.0.0.1:8124, env: test}
+environments:
+  prod:
+    server: chauth.example.com:9440                 # native TLS
+    httpServer: https://chauth.example.com:8443     # HTTPS, also serves /.well-known/chauth and /v1/access
+    # serverCA: /path/to/ca.pem
+    token:
+      login: browser
+      issuer: https://auth.example.com/
+      clientId: example-cli
+      resource: https://clickhouse.example.com
+      scope: openid offline_access clickhouse:read
+  test:
+    server: chauth-test.example.com:9440
+    httpServer: https://chauth-test.example.com:8443
+    token:                                          # re-read on every connection or request
+      file: /run/secrets/clickhouse-token.json
+      field: access_token
+      statusFile: /run/secrets/clickhouse-token.status

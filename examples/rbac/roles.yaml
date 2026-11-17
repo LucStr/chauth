@@ -1,0 +1,13 @@
+# Built-in roles need no YAML: <instance>.<db>.read|write for every database in the serve config.
+# A grant names a database (level read|write; "*" = every database of the instance) or an upstream
+# role from the instance's roles allowlist, granted when the token's scope reaches its level.
+apiVersion: chauth.dev/v1alpha1
+kind: ChRole
+metadata:
+  name: analytics-read
+spec:
+  grants:
+    - {instance: main, database: core, level: read}
+    - {instance: main, database: otel, level: read}
+    - {instance: main, database: system, level: read}
+    - {instance: main, role: chauth_querylog_read, level: read}
