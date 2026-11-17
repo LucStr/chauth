@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"net/url"
 	"path"
 	"strconv"
 	"strings"
@@ -26,18 +25,19 @@ import (
 
 // Client credentials removed from every proxied request, compared ignoring case.
 var (
-	strippedParams  = []string{"user", "password", "quota_key", "database"}
+	strippedParams  = []string{"user", "password", "quota_key", chapi.CORSParam}
 	strippedHeaders = []string{"Authorization", "X-ClickHouse-User", "X-ClickHouse-Key", "X-ClickHouse-Quota",
 		"X-ClickHouse-SSL-Certificate-Auth", "X-ClickHouse-Database"}
 )
 
 // NewHTTPServer is the HTTPS server for Handler with the pre-auth limits applied; the caller sets
-// Addr or calls ServeTLS.
+// Addr or calls ServeTLS. There is no read or write timeout: bodies stream.
 func (s *Server) NewHTTPServer() *http.Server {
 	return &http.Server{
 		Handler:           s.Handler(),
 		TLSConfig:         s.tls,
 		ReadHeaderTimeout: time.Duration(s.cfg.Limits.HandshakeTimeout),
+		IdleTimeout:       chapi.IdleTimeout,
 		MaxHeaderBytes:    s.cfg.Limits.PreAuthMaxBytes,
 	}
 }
@@ -104,7 +104,7 @@ func (s *Server) proxyHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer lease.Release()
 	a.tempUser = lease.User
-	query = appendParam(query, "database", d.Database)
+	query = chapi.AppendParam(query, "database", d.Database)
 
 	var upstreamErr error
 	rp := &httputil.ReverseProxy{
@@ -129,7 +129,10 @@ func (s *Server) proxyHTTP(w http.ResponseWriter, r *http.Request) {
 			pr.Out.SetBasicAuth(lease.User, lease.Password)
 			chapi.NoReplay(pr.Out)
 		},
-		ModifyResponse: hideLoginFailure,
+		ModifyResponse: func(resp *http.Response) error {
+			chapi.StripCORS(resp.Header)
+			return hideLoginFailure(resp)
+		},
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
 			upstreamErr = err
 			http.Error(w, "chauth: the upstream request failed", http.StatusBadGateway)
@@ -183,32 +186,12 @@ func requestToken(r *http.Request) string {
 	return ""
 }
 
-// rewriteQuery drops every client credential and database parameter from the raw query, keeping the
-// rest in order and as sent, and returns the target from the database parameter or header.
+// rewriteQuery drops every client credential, CORS and database parameter from the raw query,
+// keeping the rest in order and as sent, and returns the target from the database parameter or header.
 func rewriteQuery(r *http.Request) (string, string, error) {
-	var kept []string
-	var targets []string
-	for _, part := range strings.Split(r.URL.RawQuery, "&") {
-		if part == "" {
-			continue
-		}
-		rawKey, rawValue, _ := strings.Cut(part, "=")
-		key, err := url.QueryUnescape(rawKey)
-		if err != nil {
-			return "", "", fmt.Errorf("bad query parameter %q", rawKey)
-		}
-		if strings.EqualFold(key, "database") {
-			v, err := url.QueryUnescape(rawValue)
-			if err != nil {
-				return "", "", errors.New("bad database parameter")
-			}
-			targets = append(targets, v)
-			continue
-		}
-		if stripped(key) {
-			continue
-		}
-		kept = append(kept, part)
+	kept, targets, err := chapi.FilterQuery(r.URL.RawQuery, "database", func(k string) bool { return chapi.OneOf(k, strippedParams...) })
+	if err != nil {
+		return "", "", err
 	}
 	for k, vs := range r.Header {
 		if strings.EqualFold(k, "X-ClickHouse-Database") {
@@ -222,24 +205,7 @@ func rewriteQuery(r *http.Request) (string, string, error) {
 		}
 		target = t
 	}
-	return strings.Join(kept, "&"), target, nil
-}
-
-func stripped(key string) bool {
-	for _, p := range strippedParams {
-		if strings.EqualFold(key, p) {
-			return true
-		}
-	}
-	return false
-}
-
-func appendParam(query, key, value string) string {
-	p := url.QueryEscape(key) + "=" + url.QueryEscape(value)
-	if query == "" {
-		return p
-	}
-	return query + "&" + p
+	return kept, target, nil
 }
 
 // statusWriter records the status; Unwrap keeps flushing and aborting working through it.

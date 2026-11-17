@@ -459,6 +459,8 @@ func TestHTTPCredentialStripping(t *testing.T) {
 		{"database parameter and header agree", "database=core", http.Header{"X-Clickhouse-Database": {"core"}}, 200},
 		{"duplicate database parameters disagree", "database=core&database=otel", nil, 400},
 		{"database header alone", "", http.Header{"X-Clickhouse-Database": {"core"}}, 200},
+		{"CORS parameter", "add_http_cors_header=1", http.Header{"Origin": {"https://evil.example"}}, 200},
+		{"CORS parameter in mixed case", "Add_HTTP_Cors_Header=1", http.Header{"Origin": {"https://evil.example"}}, 200},
 	}
 	var ids []string
 	for _, tt := range tests {
@@ -477,6 +479,14 @@ func TestHTTPCredentialStripping(t *testing.T) {
 				t.Fatalf("ran as %q", body)
 			}
 		})
+	}
+	direct, _ := http.NewRequest(http.MethodPost, "http://"+shared.PlainHTTP+"/?add_http_cors_header=1", strings.NewReader("SELECT 1"))
+	direct.SetBasicAuth("default", "root-secret")
+	direct.Header.Set("Origin", "https://evil.example")
+	if resp, err := http.DefaultClient.Do(direct); err != nil || resp.Header.Get("Access-Control-Allow-Origin") == "" {
+		t.Fatalf("ClickHouse itself sent no Access-Control-Allow-Origin (%v); the CORS rows prove nothing", err)
+	} else {
+		resp.Body.Close()
 	}
 	mustRoot(t, "SYSTEM FLUSH LOGS")
 	if got := mustRoot(t, "SELECT DISTINCT user || ' ' || quota_key FROM system.query_log WHERE type = 'QueryFinish' AND query_id IN ("+strings.Join(ids, ",")+")"); !strings.HasPrefix(got, "chauth_tmp_") || strings.Contains(got, "\n") || strings.TrimSpace(got) != got {
