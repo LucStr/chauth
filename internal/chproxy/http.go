@@ -55,9 +55,15 @@ func (s *Server) NewHTTPServer() *http.Server {
 // Handler serves discovery, access and the ClickHouse HTTP interface.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET "+chapi.DiscoveryPath, s.discovery)
+	mux.HandleFunc("GET "+chapi.DiscoveryPath, func(w http.ResponseWriter, r *http.Request) {
+		closeAfter(w)
+		s.discovery(w, r)
+	})
 	mux.HandleFunc("GET "+chapi.AccessPath, s.access)
-	mux.HandleFunc("GET /ping", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "Ok.\n") })
+	mux.HandleFunc("GET /ping", func(w http.ResponseWriter, _ *http.Request) {
+		closeAfter(w)
+		_, _ = io.WriteString(w, "Ok.\n")
+	})
 	mux.HandleFunc("/", s.proxyHTTP)
 	return mux
 }
@@ -84,6 +90,7 @@ func (s *Server) proxyHTTP(w http.ResponseWriter, r *http.Request) {
 	sw := &statusWriter{ResponseWriter: w}
 	// fail answers f; reason, when set, is logged instead of f.msg.
 	fail := func(f *failure, reason string) {
+		closeAfter(w)
 		a.status = f.httpStatus()
 		finish(f.decision(), cmp.Or(reason, f.msg))
 		if a.status == http.StatusUnauthorized {
@@ -192,6 +199,13 @@ func queryIDOf(query string) string {
 	return ids[len(ids)-1]
 }
 
+// closeAfter ends the connection with this answer and stops reading the request: otherwise the
+// server would wait for an unread body, so a client without a token could hold a connection slot.
+func closeAfter(w http.ResponseWriter) {
+	w.Header().Set("Connection", "close")
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now())
+}
+
 // hideLoginFailure replaces an upstream authentication error, which a retry may fix, with a 502.
 func hideLoginFailure(resp *http.Response) error {
 	if resp.StatusCode < 400 || resp.Header.Get("X-ClickHouse-Exception-Code") != strconv.Itoa(chwire.CodeAuthenticationFailed) {
@@ -290,6 +304,7 @@ func (s *Server) access(w http.ResponseWriter, r *http.Request) {
 	raw, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if !ok {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="chauth"`)
+		closeAfter(w)
 		writeJSON(w, http.StatusUnauthorized, chapi.Error{Error: "send the database token as Authorization: Bearer <token>"})
 		return
 	}
@@ -299,11 +314,13 @@ func (s *Server) access(w http.ResponseWriter, r *http.Request) {
 		if !errors.Is(err, token.ErrDenied) {
 			code = http.StatusInternalServerError
 		}
+		closeAfter(w)
 		writeJSON(w, code, chapi.Error{Error: err.Error()})
 		return
 	}
 	policy := s.rbac.Policy()
 	if policy == nil {
+		closeAfter(w)
 		writeJSON(w, http.StatusServiceUnavailable, chapi.Error{Error: "access rules are not loaded"})
 		return
 	}

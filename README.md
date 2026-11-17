@@ -192,7 +192,8 @@ config: [`docs/config.md`](docs/config.md).
 - Before a token is accepted, a client may send at most `preAuthMaxBytes` (64 KiB) within
   `handshakeTimeout` (10 s), TLS handshake included; at most `maxPreAuthConnections` (512) native
   connections may be in that state (optionally per address), and the HTTPS port holds at most
-  `maxHTTPConnections` (2048) connections. Upstream TLS is always verified (`verify-full`, or
+  `maxHTTPConnections` (2048) connections. Every HTTPS answer given without a verified token
+  (refusals, `/ping`, discovery) closes its connection without reading the rest of the request. Upstream TLS is always verified (`verify-full`, or
   `verify-ca`).
 - An HTTP request whose client goes away has its upstream query cancelled: serve gives every
   forwarded request a `query_id` (keeping the client's) and replaces it, as the temp user, with an

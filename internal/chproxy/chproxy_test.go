@@ -1328,3 +1328,81 @@ func TestHelloInTwoWrites(t *testing.T) {
 		t.Fatalf("answer packet %d, %v; want the server Hello", typ, err)
 	}
 }
+
+// TestUnauthenticatedConnectionsClose: every answer given without a verified token closes the
+// connection at once, even when the client sent only part of a body, so such clients cannot hold
+// the HTTPS connection slots; an authenticated client keeps its connection.
+func TestUnauthenticatedConnectionsClose(t *testing.T) {
+	const slots = 3
+	h := start(t, coreRead, func(c *chconfig.Config) { c.Limits.MaxHTTPConnections = slots })
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hs := h.srv.NewHTTPServer()
+	go func() { _ = hs.ServeTLS(h.srv.LimitHTTP(ln), "", "") }()
+	defer hs.Close()
+	tok := shared.Issuer.Token(chtest.Claims{})
+	partial := "Content-Length: 100000\r\n\r\nSELECT"
+	tests := []struct {
+		name, request string
+		status        int
+	}{
+		{"no token, partial body", "POST /?database=core HTTP/1.1\r\nHost: x\r\n" + partial, 401},
+		{"bad token, partial body", "POST /?database=core HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer bad\r\n" + partial, 401},
+		{"bad target, partial body", "POST /?database=core&database=otel HTTP/1.1\r\nHost: x\r\n" + partial, 400},
+		{"ping", "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n", 200},
+		{"discovery", "GET /.well-known/chauth HTTP/1.1\r\nHost: x\r\n\r\n", 200},
+		{"access without a token", "GET /v1/access HTTP/1.1\r\nHost: x\r\n\r\n", 401},
+		{"no binding", "POST /?database=otel HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + tok + "\r\n" + partial, 403},
+		{"not ready", "POST /?database=core HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + tok + "\r\n" + partial, 503},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.status == 503 {
+				h.srv.instances["main"].ready.Store(false)
+			}
+			var conns []net.Conn
+			for range slots {
+				c, err := tls.Dial("tcp", ln.Addr().String(), shared.ClientTLS)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+				if _, err := io.WriteString(c, tt.request); err != nil {
+					t.Fatal(err)
+				}
+				conns = append(conns, c)
+			}
+			for _, c := range conns {
+				br := bufio.NewReader(c)
+				resp, err := http.ReadResponse(br, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, _ = io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				if resp.StatusCode != tt.status || !resp.Close {
+					t.Fatalf("status %d, Connection: close %v; want %d and close", resp.StatusCode, resp.Close, tt.status)
+				}
+				if _, err := br.ReadByte(); err != io.EOF {
+					t.Fatalf("connection still open after the answer: %v", err)
+				}
+			}
+			h.srv.instances["main"].ready.Store(true)
+			client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{TLSClientConfig: shared.ClientTLS}}
+			defer client.CloseIdleConnections()
+			req, _ := http.NewRequest(http.MethodPost, "https://"+ln.Addr().String()+"/?database=core", strings.NewReader("SELECT 1"))
+			req.Header.Set("Authorization", "Bearer "+tok)
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("authenticated client after the refusals: %v", err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != 200 || resp.Close {
+				t.Fatalf("authenticated: status %d, close %v; want 200 kept alive", resp.StatusCode, resp.Close)
+			}
+		})
+	}
+}
