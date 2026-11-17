@@ -1,0 +1,340 @@
+package chproxy
+
+import (
+	"bytes"
+	"cmp"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"path"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/LucStr/chauth/internal/chapi"
+	"github.com/LucStr/chauth/internal/chwire"
+	"github.com/LucStr/chauth/internal/rbac"
+	"github.com/LucStr/chauth/internal/token"
+)
+
+// Client credentials removed from every proxied request, compared ignoring case.
+var (
+	strippedParams  = []string{"user", "password", "quota_key", "database"}
+	strippedHeaders = []string{"Authorization", "X-ClickHouse-User", "X-ClickHouse-Key", "X-ClickHouse-Quota",
+		"X-ClickHouse-SSL-Certificate-Auth", "X-ClickHouse-Database"}
+)
+
+// NewHTTPServer is the HTTPS server for Handler with the pre-auth limits applied; the caller sets
+// Addr or calls ServeTLS.
+func (s *Server) NewHTTPServer() *http.Server {
+	return &http.Server{
+		Handler:           s.Handler(),
+		TLSConfig:         s.tls,
+		ReadHeaderTimeout: time.Duration(s.cfg.Limits.HandshakeTimeout),
+		MaxHeaderBytes:    s.cfg.Limits.PreAuthMaxBytes,
+	}
+}
+
+// Handler serves discovery, access and the ClickHouse HTTP interface.
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET "+chapi.DiscoveryPath, s.discovery)
+	mux.HandleFunc("GET "+chapi.AccessPath, s.access)
+	mux.HandleFunc("GET /ping", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "Ok.\n") })
+	mux.HandleFunc("/", s.proxyHTTP)
+	return mux
+}
+
+func (f *failure) httpStatus() int {
+	switch f.kind {
+	case badTarget:
+		return http.StatusBadRequest
+	case unavailable:
+		return http.StatusServiceUnavailable
+	case limited:
+		return http.StatusTooManyRequests
+	}
+	if f.forbidden {
+		return http.StatusForbidden
+	}
+	return http.StatusUnauthorized
+}
+
+func (s *Server) proxyHTTP(w http.ResponseWriter, r *http.Request) {
+	ctx, finish, a := s.begin(r.Context(), "http")
+	sw := &statusWriter{ResponseWriter: w}
+	// fail answers f; reason, when set, is logged instead of f.msg.
+	fail := func(f *failure, reason string) {
+		a.status = f.httpStatus()
+		finish(f.decision(), cmp.Or(reason, f.msg))
+		if a.status == http.StatusUnauthorized {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="chauth"`)
+		}
+		w.Header().Set("X-ClickHouse-Exception-Code", strconv.Itoa(int(f.nativeCode())))
+		http.Error(w, f.msg, a.status)
+	}
+	raw := requestToken(r)
+	query, target, err := rewriteQuery(r)
+	if err != nil {
+		fail(&failure{kind: badTarget, msg: "chauth: " + err.Error()}, "")
+		return
+	}
+	a.db = target
+	in, d, f := s.decide(ctx, raw, target, a)
+	if f != nil {
+		fail(f, "")
+		return
+	}
+	if !s.admit(d.Claims.Subject) {
+		fail(&failure{kind: limited, msg: fmt.Sprintf("chauth: too many concurrent requests for %s (limit %d)", d.Claims.Username, s.cfg.Limits.MaxConnectionsPerUser)}, "")
+		return
+	}
+	defer s.leave(d.Claims.Subject)
+	lease, err := in.users.Acquire(ctx, d.key())
+	if err != nil {
+		fail(acquireFailure(err), err.Error())
+		return
+	}
+	defer lease.Release()
+	a.tempUser = lease.User
+	query = appendParam(query, "database", d.Database)
+
+	var upstreamErr error
+	rp := &httputil.ReverseProxy{
+		Transport:     in.transport,
+		FlushInterval: -1,
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.Out.URL.Scheme, pr.Out.URL.Host = in.httpURL.Scheme, in.httpURL.Host
+			pr.Out.URL.Path = path.Join("/", in.httpURL.Path, r.URL.Path)
+			if strings.HasSuffix(r.URL.Path, "/") && !strings.HasSuffix(pr.Out.URL.Path, "/") {
+				pr.Out.URL.Path += "/"
+			}
+			pr.Out.URL.RawPath, pr.Out.URL.RawQuery, pr.Out.Host = "", query, in.httpURL.Host
+			for k := range pr.Out.Header {
+				for _, h := range strippedHeaders {
+					if strings.EqualFold(k, h) {
+						delete(pr.Out.Header, k)
+					}
+				}
+			}
+			pr.SetXForwarded()
+			pr.Out.SetBasicAuth(lease.User, lease.Password)
+			chapi.NoReplay(pr.Out)
+		},
+		ModifyResponse: hideLoginFailure,
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+			upstreamErr = err
+			http.Error(w, "chauth: the upstream request failed", http.StatusBadGateway)
+		},
+	}
+	defer func() {
+		a.status = sw.status
+		if p := recover(); p != nil {
+			finish("error", "response stream cut")
+			panic(p)
+		}
+		if upstreamErr != nil {
+			finish("error", upstreamErr.Error())
+			return
+		}
+		finish("allow", "")
+	}()
+	rp.ServeHTTP(sw, r.WithContext(ctx))
+}
+
+// hideLoginFailure replaces an upstream authentication error, which names the temp user.
+func hideLoginFailure(resp *http.Response) error {
+	if resp.StatusCode < 400 || resp.Header.Get("X-ClickHouse-Exception-Code") != strconv.Itoa(chwire.CodeAuthenticationFailed) {
+		return nil
+	}
+	resp.Body.Close()
+	msg := []byte("chauth: the upstream refused the temp user's login; retry the request\n")
+	resp.Body = io.NopCloser(bytes.NewReader(msg))
+	resp.ContentLength = int64(len(msg))
+	resp.Header.Set("Content-Length", strconv.Itoa(len(msg)))
+	resp.Header.Del("Content-Encoding")
+	resp.StatusCode, resp.Status = http.StatusBadGateway, "502 Bad Gateway"
+	return nil
+}
+
+// requestToken is the Bearer token, or the password of Basic auth.
+func requestToken(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	scheme, value, _ := strings.Cut(h, " ")
+	switch {
+	case strings.EqualFold(scheme, "Bearer"):
+		return strings.TrimSpace(value)
+	case strings.EqualFold(scheme, "Basic"):
+		b, err := base64.StdEncoding.DecodeString(strings.TrimSpace(value))
+		if err != nil {
+			return ""
+		}
+		_, pw, _ := strings.Cut(string(b), ":")
+		return pw
+	}
+	return ""
+}
+
+// rewriteQuery drops every client credential and database parameter from the raw query, keeping the
+// rest in order and as sent, and returns the target from the database parameter or header.
+func rewriteQuery(r *http.Request) (string, string, error) {
+	var kept []string
+	var targets []string
+	for _, part := range strings.Split(r.URL.RawQuery, "&") {
+		if part == "" {
+			continue
+		}
+		rawKey, rawValue, _ := strings.Cut(part, "=")
+		key, err := url.QueryUnescape(rawKey)
+		if err != nil {
+			return "", "", fmt.Errorf("bad query parameter %q", rawKey)
+		}
+		if strings.EqualFold(key, "database") {
+			v, err := url.QueryUnescape(rawValue)
+			if err != nil {
+				return "", "", errors.New("bad database parameter")
+			}
+			targets = append(targets, v)
+			continue
+		}
+		if stripped(key) {
+			continue
+		}
+		kept = append(kept, part)
+	}
+	for k, vs := range r.Header {
+		if strings.EqualFold(k, "X-ClickHouse-Database") {
+			targets = append(targets, vs...)
+		}
+	}
+	target := ""
+	for i, t := range targets {
+		if i > 0 && t != target {
+			return "", "", errors.New("the database parameter and header disagree")
+		}
+		target = t
+	}
+	return strings.Join(kept, "&"), target, nil
+}
+
+func stripped(key string) bool {
+	for _, p := range strippedParams {
+		if strings.EqualFold(key, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func appendParam(query, key, value string) string {
+	p := url.QueryEscape(key) + "=" + url.QueryEscape(value)
+	if query == "" {
+		return p
+	}
+	return query + "&" + p
+}
+
+// statusWriter records the status; Unwrap keeps flushing and aborting working through it.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	if w.status == 0 {
+		w.status = code
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusWriter) Write(b []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (s *Server) discovery(w http.ResponseWriter, r *http.Request) {
+	host := r.Host
+	if h, _, err := net.SplitHostPort(r.Host); err == nil {
+		host = h
+	}
+	d := chapi.Discovery{
+		Native: joinHostPort(host, s.cfg.Listen.Native), HTTP: "https://" + joinHostPort(host, s.cfg.Listen.HTTP),
+		Issuer: s.cfg.OIDC.Issuer, Audience: s.cfg.OIDC.Audience,
+		Scopes:     chapi.Scopes{Read: s.cfg.OIDC.Scopes.Read, Write: s.cfg.OIDC.Scopes.Write},
+		AccessHelp: s.cfg.AccessHelp, Instances: []chapi.Instance{},
+	}
+	for _, in := range s.cfg.Instances {
+		d.Instances = append(d.Instances, chapi.Instance{Name: in.Name, Databases: in.Databases, Roles: nonNil(in.Roles)})
+	}
+	writeJSON(w, http.StatusOK, d)
+}
+
+func (s *Server) access(w http.ResponseWriter, r *http.Request) {
+	raw, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !ok {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="chauth"`)
+		writeJSON(w, http.StatusUnauthorized, chapi.Error{Error: "send the database token as Authorization: Bearer <token>"})
+		return
+	}
+	claims, err := s.verifier.Verify(r.Context(), raw)
+	if err != nil {
+		code := http.StatusUnauthorized
+		if !errors.Is(err, token.ErrDenied) {
+			code = http.StatusInternalServerError
+		}
+		writeJSON(w, code, chapi.Error{Error: err.Error()})
+		return
+	}
+	policy := s.rbac.Policy()
+	if policy == nil {
+		writeJSON(w, http.StatusServiceUnavailable, chapi.Error{Error: "access rules are not loaded"})
+		return
+	}
+	scopeCap := rbac.ScopeCap(claims.Scopes, s.cfg.OIDC.Scopes.Read, s.cfg.OIDC.Scopes.Write)
+	who := rbac.Who{User: claims.Username, Groups: claims.Groups, FoldUser: s.cfg.OIDC.FoldUsername()}
+	out := []chapi.Access{}
+	for _, in := range s.cfg.Instances {
+		g := grants(policy, who, in, scopeCap)
+		e := chapi.Access{Instance: in.Name, Databases: []chapi.DatabaseAccess{}, Roles: nonNil(g.Roles)}
+		for _, db := range in.Databases {
+			if lv := g.Databases[db]; lv > rbac.None {
+				e.Databases = append(e.Databases, chapi.DatabaseAccess{Database: db, Level: lv.String()})
+			}
+		}
+		if len(e.Databases) == 0 && len(e.Roles) == 0 {
+			continue
+		}
+		e.Level = level(policy, who, in.Name, scopeCap, g).String()
+		out = append(out, e)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func nonNil(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// joinHostPort is host with the port of the listen address addr.
+func joinHostPort(host, addr string) string {
+	_, port, _ := net.SplitHostPort(addr)
+	return net.JoinHostPort(host, port)
+}

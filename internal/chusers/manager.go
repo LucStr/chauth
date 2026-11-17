@@ -1,0 +1,472 @@
+// Package chusers creates, reuses and drops chauth's temp users on one ClickHouse instance. A temp
+// user belongs to the process that created it; a sweep drops expired temp users of any process.
+package chusers
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base32"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
+
+	"github.com/LucStr/chauth/internal/chconfig"
+	"github.com/LucStr/chauth/internal/chwire"
+	"github.com/LucStr/chauth/internal/rbac"
+)
+
+// Key decides which connections share a temp user: all fields must match.
+type Key struct {
+	Subject string
+	// Email goes into the user's log_comment.
+	Email string
+	Level rbac.Level
+	// Roles are the upstream roles the user is granted.
+	Roles []string
+}
+
+func (k Key) id() string {
+	roles := slices.Clone(k.Roles)
+	slices.Sort(roles)
+	h := sha256.Sum256([]byte(k.Subject + "\x00" + k.Email + "\x00" + k.Level.String() + "\x00" + strings.Join(roles, ",")))
+	return hex.EncodeToString(h[:])
+}
+
+// Options are the lifetimes from the serve config's limits.
+type Options struct {
+	// LeaseDuration is how long one user is handed out to new connections.
+	LeaseDuration time.Duration
+	// MaxConnectionAge is the longest a connection may use a user after it was handed out.
+	MaxConnectionAge time.Duration
+	// IdleTTL is how long a user without connections is kept for reuse.
+	IdleTTL time.Duration
+	// MaxRefs is how many connections share one user before another is created.
+	MaxRefs int
+	// ProbeTimeout bounds the retries of the first login of a new user.
+	ProbeTimeout time.Duration
+	Log          *slog.Logger
+}
+
+// validGrace is added to a user's longest possible use for its VALID UNTIL.
+const validGrace = 5 * time.Minute
+
+type Manager struct {
+	admin  *Admin
+	prefix string
+	hosts  []string
+	opts   Options
+	nonce  string
+
+	mu      sync.Mutex
+	current map[string]*entry // key id → the user new connections get
+	byName  map[string]*entry // every user this process created and has not dropped
+	retry   map[string]bool   // users whose drop failed
+
+	created, dropped, dropFailed metric.Int64Counter
+	live                         metric.Int64UpDownCounter
+}
+
+type entry struct {
+	name, password, key  string
+	leaseEnd, validUntil time.Time
+	refs                 int
+	dropped              bool
+	ready                chan struct{}
+	err                  error
+	idle                 *time.Timer
+}
+
+// Lease is one connection's use of a temp user; Release it exactly once when the connection ends.
+type Lease struct {
+	User, Password string
+	Expires        time.Time
+	release        func()
+	once           sync.Once
+}
+
+func (l *Lease) Release() { l.once.Do(l.release) }
+
+func NewManager(admin *Admin, in chconfig.Instance, opts Options) *Manager {
+	if opts.MaxRefs <= 0 {
+		opts.MaxRefs = 20
+	}
+	if opts.ProbeTimeout <= 0 {
+		opts.ProbeTimeout = 10 * time.Second
+	}
+	if opts.Log == nil {
+		opts.Log = slog.Default()
+	}
+	meter := otel.Meter("github.com/LucStr/chauth/internal/chusers")
+	created, _ := meter.Int64Counter("chauth.users.created", metric.WithDescription("Temp users created"))
+	dropped, _ := meter.Int64Counter("chauth.users.dropped", metric.WithDescription("Temp users dropped"))
+	failed, _ := meter.Int64Counter("chauth.users.drop_failed", metric.WithDescription("Temp users that could not be dropped"))
+	live, _ := meter.Int64UpDownCounter("chauth.users.live", metric.WithDescription("Temp users this process holds"))
+	return &Manager{
+		admin: admin, prefix: in.TempUserPrefix, hosts: in.TempUserHostIPs, opts: opts, nonce: randomName(6),
+		current: map[string]*entry{}, byName: map[string]*entry{}, retry: map[string]bool{},
+		created: created, dropped: dropped, dropFailed: failed, live: live,
+	}
+}
+
+// Nonce identifies this process in the names of its users.
+func (m *Manager) Nonce() string { return m.nonce }
+
+// Acquire hands out a temp user for k, creating one when none can be reused. A new user has logged
+// in once before it is handed out.
+func (m *Manager) Acquire(ctx context.Context, k Key) (*Lease, error) {
+	if err := checkKey(k); err != nil {
+		return nil, err
+	}
+	id := k.id()
+	now := time.Now()
+	m.mu.Lock()
+	e := m.current[id]
+	creator := false
+	if e == nil || e.refs >= m.opts.MaxRefs || !now.Before(e.leaseEnd) || failed(e) {
+		e = &entry{
+			name: m.prefix + short(k.Subject) + "_" + m.nonce + randomName(6), password: randomName(32), key: id,
+			leaseEnd: now.Add(m.opts.LeaseDuration), ready: make(chan struct{}),
+		}
+		e.validUntil = e.leaseEnd.Add(m.opts.MaxConnectionAge + validGrace)
+		m.current[id] = e
+		m.byName[e.name] = e
+		creator = true
+	}
+	e.refs++
+	if e.idle != nil {
+		e.idle.Stop()
+		e.idle = nil
+	}
+	m.mu.Unlock()
+
+	var err error
+	if creator {
+		err = m.create(ctx, e, k)
+		m.mu.Lock()
+		e.err = err
+		m.mu.Unlock()
+		close(e.ready)
+	} else {
+		select {
+		case <-e.ready:
+			m.mu.Lock()
+			err = e.err
+			m.mu.Unlock()
+		case <-ctx.Done():
+			err = ctx.Err()
+		}
+	}
+	if err != nil {
+		m.release(e)
+		return nil, err
+	}
+	return &Lease{User: e.name, Password: e.password, Expires: e.validUntil, release: func() { m.release(e) }}, nil
+}
+
+// failed reports a user whose creation finished with an error; m.mu must be held.
+func failed(e *entry) bool {
+	select {
+	case <-e.ready:
+		return e.err != nil
+	default:
+		return false
+	}
+}
+
+func (m *Manager) release(e *entry) {
+	m.mu.Lock()
+	e.refs--
+	if e.refs > 0 {
+		m.mu.Unlock()
+		return
+	}
+	done := false
+	select {
+	case <-e.ready:
+		done = true
+	default:
+	}
+	if done && e.err == nil && m.current[e.key] == e && time.Now().Before(e.leaseEnd) {
+		e.idle = time.AfterFunc(m.opts.IdleTTL, func() { m.dropIdle(e) })
+		m.mu.Unlock()
+		return
+	}
+	m.forget(e)
+	drop := done && e.err == nil && !e.dropped
+	e.dropped = true
+	m.mu.Unlock()
+	if drop {
+		m.drop(context.Background(), e.name)
+	}
+}
+
+func (m *Manager) dropIdle(e *entry) {
+	m.mu.Lock()
+	if e.refs > 0 || m.byName[e.name] != e || e.dropped {
+		m.mu.Unlock()
+		return
+	}
+	m.forget(e)
+	e.dropped = true
+	m.mu.Unlock()
+	m.drop(context.Background(), e.name)
+}
+
+// forget removes e from the maps; m.mu must be held.
+func (m *Manager) forget(e *entry) {
+	if m.byName[e.name] == e {
+		delete(m.byName, e.name)
+	}
+	if m.current[e.key] == e {
+		delete(m.current, e.key)
+	}
+}
+
+func (m *Manager) create(ctx context.Context, e *entry, k Key) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "CREATE USER %s IDENTIFIED WITH sha256_password BY %s VALID UNTIL %s",
+		e.name, Literal(e.password), Literal(e.validUntil.UTC().Format(time.DateTime)+" UTC"))
+	if len(m.hosts) > 0 {
+		hosts := make([]string, len(m.hosts))
+		for i, h := range m.hosts {
+			hosts[i] = "IP " + Literal(h)
+		}
+		b.WriteString(" HOST " + strings.Join(hosts, ", "))
+	}
+	b.WriteString(" SETTINGS log_comment = " + Literal(k.Email) + " CONST")
+	if k.Level < rbac.Write {
+		b.WriteString(", readonly = 2 CONST")
+	}
+	if err := m.admin.Exec(ctx, b.String()); err != nil {
+		return fmt.Errorf("create temp user: %w", err)
+	}
+	m.created.Add(ctx, 1)
+	m.live.Add(ctx, 1)
+	quoted := make([]string, len(k.Roles))
+	for i, r := range k.Roles {
+		quoted[i] = "`" + r + "`"
+	}
+	err := m.admin.Exec(ctx, "GRANT "+strings.Join(quoted, ", ")+" TO "+e.name)
+	if err != nil {
+		err = fmt.Errorf("grant roles to temp user: %w", err)
+	} else {
+		err = m.probe(ctx, e)
+	}
+	if err != nil {
+		m.drop(context.WithoutCancel(ctx), e.name)
+	}
+	return err
+}
+
+// probe logs in as the new user until it works: on a cluster with several replicas the user may not
+// have reached the replica that answers yet.
+func (m *Manager) probe(ctx context.Context, e *entry) error {
+	deadline := time.Now().Add(m.opts.ProbeTimeout)
+	for wait := 20 * time.Millisecond; ; wait = min(2*wait, time.Second) {
+		err := m.admin.Login(ctx, e.name, e.password)
+		if err == nil || !isCode(err, chwire.CodeAuthenticationFailed) || time.Now().Add(wait).After(deadline) {
+			if err != nil {
+				return fmt.Errorf("first login of temp user: %w", err)
+			}
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+}
+
+func (m *Manager) drop(ctx context.Context, name string) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := m.admin.Exec(ctx, "DROP USER IF EXISTS "+name); err != nil {
+		m.dropFailed.Add(ctx, 1)
+		m.opts.Log.Error("temp user not dropped; retried on the next sweep", "temp_user", name, "error", err)
+		m.mu.Lock()
+		m.retry[name] = true
+		m.mu.Unlock()
+		return
+	}
+	m.dropped.Add(ctx, 1)
+	m.live.Add(ctx, -1)
+	m.mu.Lock()
+	delete(m.retry, name)
+	m.mu.Unlock()
+}
+
+// Sweep drops temp users of any process whose VALID UNTIL has passed, and retries this process's
+// failed drops. A user with no VALID UNTIL is never dropped.
+func (m *Manager) Sweep(ctx context.Context) (int, error) {
+	var expired []string
+	now := time.Now().Unix()
+	err := m.admin.Rows(ctx, "SELECT name, arrayMap(x -> toUnixTimestamp(x), valid_until) AS until FROM system.users WHERE startsWith(name, "+Literal(m.prefix)+")",
+		func(line []byte) error {
+			var row struct {
+				Name  string  `json:"name"`
+				Until []int64 `json:"until"`
+			}
+			if err := json.Unmarshal(line, &row); err != nil {
+				return err
+			}
+			if len(row.Until) > 0 && !slices.ContainsFunc(row.Until, func(t int64) bool { return t == 0 || t > now }) {
+				expired = append(expired, row.Name)
+			}
+			return nil
+		})
+	if err != nil {
+		return 0, err
+	}
+	m.mu.Lock()
+	for name := range m.retry {
+		if !slices.Contains(expired, name) {
+			expired = append(expired, name)
+		}
+	}
+	m.mu.Unlock()
+	n := 0
+	for _, name := range expired {
+		if !strings.HasPrefix(name, m.prefix) || !validName(name) {
+			continue
+		}
+		m.mu.Lock()
+		own := m.retry[name]
+		if e := m.byName[name]; e != nil {
+			m.forget(e)
+			own = own || !e.dropped
+			e.dropped = true
+		}
+		m.mu.Unlock()
+		if own {
+			m.drop(ctx, name)
+		} else if err := m.admin.Exec(ctx, "DROP USER IF EXISTS "+name); err != nil {
+			m.opts.Log.Error("sweep: temp user not dropped", "temp_user", name, "error", err)
+			continue
+		} else {
+			m.dropped.Add(ctx, 1)
+		}
+		n++
+	}
+	return n, nil
+}
+
+// Run sweeps every interval until ctx ends.
+func (m *Manager) Run(ctx context.Context, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		if n, err := m.Sweep(ctx); err != nil {
+			m.opts.Log.Error("sweep temp users", "error", err)
+		} else if n > 0 {
+			m.opts.Log.Info("swept temp users", "dropped", n)
+		}
+	}
+}
+
+// Close drops every user this process created, in use or not; call it after the listeners closed.
+func (m *Manager) Close(ctx context.Context) {
+	m.mu.Lock()
+	names := make([]string, 0, len(m.byName))
+	for name, e := range m.byName {
+		if e.idle != nil {
+			e.idle.Stop()
+		}
+		select {
+		case <-e.ready:
+			if e.err == nil && !e.dropped {
+				names = append(names, name)
+			}
+		default:
+		}
+		e.dropped = true
+		m.forget(e)
+	}
+	m.mu.Unlock()
+	for _, name := range names {
+		m.drop(ctx, name)
+	}
+}
+
+// Users lists the users this process holds, for tests and debugging.
+func (m *Manager) Users() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, 0, len(m.byName))
+	for name := range m.byName {
+		out = append(out, name)
+	}
+	slices.Sort(out)
+	return out
+}
+
+var ErrBadKey = errors.New("temp user key rejected")
+
+func checkKey(k Key) error {
+	if k.Subject == "" || k.Email == "" {
+		return fmt.Errorf("%w: subject and email are required", ErrBadKey)
+	}
+	if !utf8.ValidString(k.Email) || strings.ContainsFunc(k.Email, unicode.IsControl) {
+		return fmt.Errorf("%w: email contains control characters", ErrBadKey)
+	}
+	if len(k.Roles) == 0 {
+		return fmt.Errorf("%w: no roles", ErrBadKey)
+	}
+	for _, r := range k.Roles {
+		if !rbac.ValidUpstreamRole(r) {
+			return fmt.Errorf("%w: role %q", ErrBadKey, r)
+		}
+	}
+	return nil
+}
+
+// Literal quotes s as a ClickHouse string literal.
+func Literal(s string) string {
+	return "'" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(s) + "'"
+}
+
+func validName(name string) bool {
+	return name != "" && !strings.ContainsFunc(name, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_')
+	})
+}
+
+// short is 8 characters of [a-z0-9] taken from sub, padded from its hash.
+func short(sub string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(sub) {
+		if b.Len() == 8 {
+			break
+		}
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	h := sha256.Sum256([]byte(sub))
+	return (b.String() + hex.EncodeToString(h[:]))[:8]
+}
+
+var lowerBase32 = base32.NewEncoding("abcdefghijklmnopqrstuvwxyz234567").WithPadding(base32.NoPadding)
+
+func randomName(n int) string {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return lowerBase32.EncodeToString(b)[:n]
+}

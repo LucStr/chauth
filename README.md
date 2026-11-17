@@ -95,45 +95,57 @@ quarantined; download it with `curl` or run `xattr -d com.apple.quarantine chaut
 
 ## Upstream setup
 
-Run once per ClickHouse service as an administrator. One read and one write role per served
+Run once per ClickHouse service as an administrator: one read and one write role per served
 database (names from `roleTemplate`, default `chauth_{database}_{level}`), a read role for each
-read-only database, any named roles you want to grant, and the admin user:
+read-only database, any named roles you want to grant, and the admin user. This is
+[`examples/clickhouse-setup.sql`](examples/clickhouse-setup.sql), which the tests run as is; adapt
+the databases, grants and password:
 
 ```sql
--- per database <db>; grant whatever "read" and "write" should mean for you
+-- Upstream objects chauth needs, for the databases core and otel and the read-only database system.
+-- The tests run this file as is, so the admin's grants here are the complete set chauth relies on.
+
+-- One read and one write role per database in instances[].databases (roleTemplate chauth_{database}_{level}).
 CREATE ROLE chauth_core_read;
-GRANT SELECT ON core.* TO chauth_core_read;
+GRANT SHOW, SELECT ON core.* TO chauth_core_read;
 CREATE ROLE chauth_core_write;
-GRANT SELECT, INSERT, ALTER, CREATE TABLE, DROP TABLE, TRUNCATE, OPTIMIZE ON core.* TO chauth_core_write;
+GRANT SHOW, SELECT, INSERT, ALTER, CREATE TABLE, CREATE VIEW, DROP TABLE, DROP VIEW, TRUNCATE, OPTIMIZE ON core.* TO chauth_core_write;
+CREATE ROLE chauth_otel_read;
+GRANT SHOW, SELECT ON otel.* TO chauth_otel_read;
+CREATE ROLE chauth_otel_write;
+GRANT SHOW, SELECT, INSERT, ALTER, CREATE TABLE, CREATE VIEW, DROP TABLE, DROP VIEW, TRUNCATE, OPTIMIZE ON otel.* TO chauth_otel_write;
 
--- a read-only database (readOnlyDatabases: [system]) needs only its read role
+-- A database in instances[].readOnlyDatabases needs only its read role.
 CREATE ROLE chauth_system_read;
-GRANT SELECT ON system.tables TO chauth_system_read;
-GRANT SELECT ON system.columns TO chauth_system_read;
+GRANT SELECT ON system.parts TO chauth_system_read;
+GRANT SELECT ON system.settings_changes TO chauth_system_read;
 
--- a named role (instances[].roles: [chauth_querylog_read])
+-- A role granted by name (instances[].roles).
 CREATE ROLE chauth_querylog_read;
 GRANT SELECT ON system.query_log TO chauth_querylog_read;
+GRANT CLUSTER ON *.* TO chauth_querylog_read;
+GRANT REMOTE ON *.* TO chauth_querylog_read;
 
--- the admin user chauth logs in as
-CREATE USER chauth_admin IDENTIFIED WITH sha256_password BY '<random>' HOST IP '10.0.0.0/14';
+-- The admin login of credentialsFile. In production add HOST IP '<network chauth connects from>'.
+-- No ALTER USER: ALTER USER <prefix>x RENAME TO y passes the prefix check and leaves the prefix.
+CREATE USER chauth_admin IDENTIFIED WITH sha256_password BY 'admin-secret';
 GRANT CREATE USER, DROP USER ON chauth_tmp_* TO chauth_admin;
-GRANT chauth_core_read, chauth_core_write, chauth_system_read, chauth_querylog_read
-  TO chauth_admin WITH ADMIN OPTION;
-GRANT SELECT ON system.users TO chauth_admin;
-SET DEFAULT ROLE ALL TO chauth_admin;
+GRANT chauth_core_read, chauth_core_write, chauth_otel_read, chauth_otel_write, chauth_system_read, chauth_querylog_read TO chauth_admin WITH ADMIN OPTION;
+GRANT SELECT(name, valid_until) ON system.users TO chauth_admin;
 ```
 
 - `CREATE USER, DROP USER ON chauth_tmp_*` lets the admin create and drop only users with the
   temp-user prefix (`tempUserPrefix`).
-- Every role a temp user may get must be granted to the admin `WITH ADMIN OPTION` and active
-  (`DEFAULT ROLE ALL`); a role chauth cannot grant fails the connection.
-- `SELECT ON system.users` lets the sweep find expired temp users.
+- Every role a temp user may get must be granted to the admin `WITH ADMIN OPTION`; a role chauth
+  cannot grant fails the connection.
+- `SELECT(name, valid_until) ON system.users` lets the sweep find expired temp users. The sweep
+  itself keeps to names with the prefix; there is deliberately no row policy on `system.users`,
+  because a row policy on a system table hides its rows from every user without one.
 - There is deliberately **no `ALTER USER`**: `ALTER USER chauth_tmp_x RENAME TO anything` passes the
   prefix check and would move a user out of the prefix, beyond the sweep and beyond the admin's
   reach. Temp users are never altered; a changed binding gives a new user.
-- `HOST IP` should be the network chauth connects from; `tempUserHostIPs` puts the same limit on
-  every temp user.
+- Limit the admin with `HOST IP` to the network chauth connects from; `tempUserHostIPs` puts the
+  same limit on every temp user.
 
 ## Access rules
 
