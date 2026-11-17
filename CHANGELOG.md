@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.1.1 (2026-11-17)
+
+- Fix: temp-user passwords had only lower-case letters and digits, so a server with password
+  complexity rules, such as every ClickHouse Cloud service, refused every temp user and every
+  connection failed. They are now 32 random characters with at least two upper-case letters,
+  lower-case letters, digits and characters of `!#%*+-=_` each. The tests run ClickHouse with
+  ClickHouse Cloud's default rules.
+- serve is ready only after a self-test per instance: create a temp user the way real ones are made,
+  grant it every role the instance can hand out, log in as it and drop it. It repeats every
+  `limits.selfTestInterval` (10m); a failure makes the instance not ready and logs the failed step and
+  ClickHouse's error once. Metrics `chauth.selftest.ok` and `chauth.selftest.time`.
+- `examples/clickhouse-setup.sql`: the example admin password meets the same rules.
+
 ## v0.1.0 (2026-11-17)
 
 First release.

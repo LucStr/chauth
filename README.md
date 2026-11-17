@@ -79,7 +79,7 @@ connects with your rights, the same trade-off as other local database proxies.
 
 ```
 docker run -v /etc/chauth:/etc/chauth -p 9440:9440 -p 8443:8443 -p 8080:8080 \
-  ghcr.io/lucstr/chauth:v0.1.0 serve --config /etc/chauth/config.yaml
+  ghcr.io/lucstr/chauth:v0.1.1 serve --config /etc/chauth/config.yaml
 ```
 
 The image runs as non-root and needs no writable filesystem. `GET :8080/healthz` answers while the
@@ -99,8 +99,8 @@ Binaries for macOS and Linux (amd64, arm64) are attached to each
 quarantined; download it with `curl` or run `xattr -d com.apple.quarantine chauth`.
 
 ```
-curl -fsSL https://github.com/LucStr/chauth/releases/download/v0.1.0/chauth_v0.1.0_darwin_arm64.tar.gz | tar -xz
-./chauth_v0.1.0_darwin_arm64/chauth version
+curl -fsSL https://github.com/LucStr/chauth/releases/download/v0.1.1/chauth_v0.1.1_darwin_arm64.tar.gz | tar -xz
+./chauth_v0.1.1_darwin_arm64/chauth version
 ```
 
 ## Upstream setup
@@ -149,6 +149,9 @@ GRANT SELECT(name, valid_until) ON system.users TO chauth_admin;
   temp-user prefix (`tempUserPrefix`).
 - Every role a temp user may get must be granted to the admin `WITH ADMIN OPTION`; a role chauth
   cannot grant keeps the instance not ready.
+- Temp-user passwords are 32 random characters with at least two upper-case letters, lower-case
+  letters, digits and characters of `!#%*+-=_` each, which meets ClickHouse Cloud's default password
+  rules; a stricter `password_complexity` on a self-managed server rejects them, and readiness says so.
 - `SELECT(name, valid_until) ON system.users` lets the sweep find expired temp users. The sweep
   itself keeps to names with the prefix; there is deliberately no row policy on `system.users`,
   because a row policy on a system table hides its rows from every user without one.
