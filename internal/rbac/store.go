@@ -36,12 +36,12 @@ func ReadDir(dir string) ([]File, error) {
 }
 
 // Load parses and compiles files in one step.
-func (fl Flavor) Load(files []File, instances, roles Instances) (*Policy, error) {
-	res, errs := fl.Parse(files)
+func Load(files []File, instances, roles Instances) (*Policy, error) {
+	res, errs := Parse(files)
 	if len(errs) > 0 {
 		return nil, errs
 	}
-	p, errs := fl.Compile(res, instances, roles)
+	p, errs := Compile(res, instances, roles)
 	if len(errs) > 0 {
 		return nil, errs
 	}
@@ -50,7 +50,6 @@ func (fl Flavor) Load(files []File, instances, roles Instances) (*Policy, error)
 
 // Store holds the live policy. A rejected set never replaces a valid one.
 type Store struct {
-	flavor    Flavor
 	instances Instances
 	roles     Instances
 	log       *slog.Logger
@@ -74,8 +73,8 @@ type Status struct {
 }
 
 // NewStore checks every set against instances and, for named-role grants, against roles.
-func NewStore(flavor Flavor, instances, roles Instances, log *slog.Logger) *Store {
-	return &Store{flavor: flavor, instances: instances, roles: roles, log: log, Settle: 100 * time.Millisecond, sleep: time.Sleep}
+func NewStore(instances, roles Instances, log *slog.Logger) *Store {
+	return &Store{instances: instances, roles: roles, log: log, Settle: 100 * time.Millisecond, sleep: time.Sleep}
 }
 
 func (s *Store) Policy() *Policy { return s.policy.Load() }
@@ -98,7 +97,7 @@ func (s *Store) Update(files []File) error {
 		}
 	}
 	s.digest = digest
-	p, err := s.flavor.Load(files, s.instances, s.roles)
+	p, err := Load(files, s.instances, s.roles)
 	if err != nil {
 		s.status.Rejected, s.status.RejectedAt = err, time.Now()
 		s.log.Error("access rules rejected; keeping the last valid set", "loaded", s.status.Loaded, "error", err)

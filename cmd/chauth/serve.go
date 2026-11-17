@@ -28,7 +28,7 @@ func serve(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	verifier := token.NewVerifier(cfg.OIDC)
-	store := rbac.NewStore(rbac.ClickHouse, cfg.Databases(), cfg.Roles(), log)
+	store := rbac.NewStore(cfg.Databases(), cfg.Roles(), log)
 	return runServe(ctx, cfg, verifier, store, log)
 }
 

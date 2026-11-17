@@ -108,7 +108,7 @@ var namePattern = regexp.MustCompile(`^[a-z0-9]([-a-z0-9._]*[a-z0-9])?$`)
 
 // Parse decodes every document of every file and checks each object on its own: schema, unknown
 // fields, required values. Cross-object checks happen in Compile.
-func (fl Flavor) Parse(files []File) (*Resources, Errors) {
+func Parse(files []File) (*Resources, Errors) {
 	res := &Resources{}
 	var errs Errors
 	for _, f := range files {
@@ -129,22 +129,21 @@ func (fl Flavor) Parse(files []File) (*Resources, Errors) {
 				continue
 			}
 			objects++
-			p := &parser{file: f.Name, flavor: fl}
+			p := &parser{file: f.Name}
 			p.object(doc.Content[0], res)
 			errs = append(errs, p.errs...)
 		}
 		// A file caught mid-write reads as empty; rejecting it keeps the last valid set live.
 		if objects == 0 && !broken {
-			errs = append(errs, Error{Pos{f.Name, 1}, fmt.Sprintf("file has no %s or %s; delete it instead of emptying it", fl.RoleKind, fl.BindingKind)})
+			errs = append(errs, Error{Pos{f.Name, 1}, fmt.Sprintf("file has no %s or %s; delete it instead of emptying it", RoleKind, BindingKind)})
 		}
 	}
 	return res, errs
 }
 
 type parser struct {
-	file   string
-	flavor Flavor
-	errs   Errors
+	file string
+	errs Errors
 }
 
 func (p *parser) errorf(n *yaml.Node, format string, args ...any) {
@@ -224,19 +223,19 @@ func (p *parser) object(n *yaml.Node, res *Resources) {
 		return
 	}
 	switch kind {
-	case p.flavor.RoleKind:
+	case RoleKind:
 		if r := p.role(spec, name); r != nil {
 			r.Pos = p.pos(n)
 			res.Roles = append(res.Roles, r)
 		}
-	case p.flavor.BindingKind:
+	case BindingKind:
 		if b := p.binding(spec, name); b != nil {
 			b.Pos = p.pos(n)
 			res.Bindings = append(res.Bindings, b)
 		}
 	case "":
 	default:
-		p.errorf(top["kind"], "kind must be %s or %s, got %s", p.flavor.RoleKind, p.flavor.BindingKind, kind)
+		p.errorf(top["kind"], "kind must be %s or %s, got %s", RoleKind, BindingKind, kind)
 	}
 }
 
@@ -288,8 +287,8 @@ func (p *parser) binding(spec *yaml.Node, name string) *Binding {
 	if ref, ok := m["roleRef"]; ok {
 		rm := p.fields(ref, "spec.roleRef", "kind", "name")
 		if rm != nil {
-			if k := p.str(rm, "kind", "spec.roleRef", ref); k != "" && k != p.flavor.RoleKind {
-				p.errorf(rm["kind"], "spec.roleRef.kind must be %s, got %s", p.flavor.RoleKind, k)
+			if k := p.str(rm, "kind", "spec.roleRef", ref); k != "" && k != RoleKind {
+				p.errorf(rm["kind"], "spec.roleRef.kind must be %s, got %s", RoleKind, k)
 			}
 			b.RoleRef = p.str(rm, "name", "spec.roleRef", ref)
 			b.RoleRefPos = p.pos(ref)

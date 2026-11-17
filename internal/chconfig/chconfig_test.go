@@ -147,7 +147,7 @@ func TestCheckReadOnly(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			yaml := "apiVersion: chauth.dev/v1alpha1\nkind: ChRole\nmetadata: {name: x}\nspec: {grants: [" + tt.grant + "]}\n"
-			res, errs := rbac.ClickHouse.Parse([]rbac.File{{Name: "a.yaml", Data: []byte(yaml)}})
+			res, errs := rbac.Parse([]rbac.File{{Name: "a.yaml", Data: []byte(yaml)}})
 			if len(errs) > 0 {
 				t.Fatal(errs)
 			}

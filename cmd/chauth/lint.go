@@ -43,9 +43,9 @@ func lint(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	res, errs := rbac.ClickHouse.Parse(files)
+	res, errs := rbac.Parse(files)
 	if len(errs) == 0 {
-		_, errs = rbac.ClickHouse.Compile(res, instances, roles)
+		_, errs = rbac.Compile(res, instances, roles)
 	}
 	if len(errs) == 0 && cfg != nil {
 		errs = cfg.CheckReadOnly(res)

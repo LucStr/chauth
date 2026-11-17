@@ -24,7 +24,7 @@ var generatedRole = regexp.MustCompile(`\.(read|write)$`)
 // Compile adds the built-in roles and checks the resources as a whole: duplicate names, role
 // references, and grants against instances and, for named-role grants, against the roles
 // allowlist. With nil instances it skips every instance and role check.
-func (fl Flavor) Compile(res *Resources, instances, roles Instances) (*Policy, Errors) {
+func Compile(res *Resources, instances, roles Instances) (*Policy, Errors) {
 	var errs Errors
 	p := &Policy{roles: map[string]*Role{}}
 	for _, r := range builtinRoles(instances) {
@@ -33,9 +33,9 @@ func (fl Flavor) Compile(res *Resources, instances, roles Instances) (*Policy, E
 	for _, r := range res.Roles {
 		if prev, ok := p.roles[r.Name]; ok {
 			if prev.Builtin {
-				errs = append(errs, Error{r.Pos, fmt.Sprintf("%s %s has the name of a built-in role", fl.RoleKind, r.Name)})
+				errs = append(errs, Error{r.Pos, fmt.Sprintf("%s %s has the name of a built-in role", RoleKind, r.Name)})
 			} else {
-				errs = append(errs, Error{r.Pos, fmt.Sprintf("duplicate %s %s, first defined at %s", fl.RoleKind, r.Name, prev.Pos)})
+				errs = append(errs, Error{r.Pos, fmt.Sprintf("duplicate %s %s, first defined at %s", RoleKind, r.Name, prev.Pos)})
 			}
 			continue
 		}
@@ -63,12 +63,12 @@ func (fl Flavor) Compile(res *Resources, instances, roles Instances) (*Policy, E
 	seen := map[string]*Binding{}
 	for _, b := range res.Bindings {
 		if prev, ok := seen[b.Name]; ok && b.Name != "" {
-			errs = append(errs, Error{b.Pos, fmt.Sprintf("duplicate %s %s, first defined at %s", fl.BindingKind, b.Name, prev.Pos)})
+			errs = append(errs, Error{b.Pos, fmt.Sprintf("duplicate %s %s, first defined at %s", BindingKind, b.Name, prev.Pos)})
 			continue
 		}
 		seen[b.Name] = b
 		if b.RoleRef != "" && p.roles[b.RoleRef] == nil && (instances != nil || !generatedRole.MatchString(b.RoleRef)) {
-			errs = append(errs, Error{b.RoleRefPos, fmt.Sprintf("roleRef %s names no %s", b.RoleRef, fl.RoleKind)})
+			errs = append(errs, Error{b.RoleRefPos, fmt.Sprintf("roleRef %s names no %s", b.RoleRef, RoleKind)})
 		}
 		p.bindings = append(p.bindings, b)
 	}

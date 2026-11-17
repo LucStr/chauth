@@ -131,8 +131,8 @@ spec:
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			files := []File{{Name: "a.yaml", Data: []byte(tt.yaml)}}
-			_, err := ClickHouse.Load(files, tt.instances, roles)
-			res, _ := ClickHouse.Parse(files)
+			_, err := Load(files, tt.instances, roles)
+			res, _ := Parse(files)
 			if w := res.Warnings(false); len(w) != len(tt.warn) || len(w) > 0 && !strings.Contains(w.Error(), tt.warn[0]) {
 				t.Errorf("exact matching: warnings = %v, want %q", w, tt.warn)
 			}
@@ -185,7 +185,7 @@ func TestReloadWaitsForFilesToSettle(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	store := NewStore(ClickHouse, instances, roles, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	store := NewStore(instances, roles, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	write("first@example.com")
 
 	// The file changes between the two reads: not settled, nothing to load yet.
@@ -241,7 +241,7 @@ func TestLastValidWins(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
-	store := NewStore(ClickHouse, instances, roles, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	store := NewStore(instances, roles, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -281,7 +281,7 @@ func TestLastValidWins(t *testing.T) {
 
 func TestGrants(t *testing.T) {
 	chInstances := Instances{"main": {"core", "otel"}, "other": {"core"}}
-	policy, err := ClickHouse.Load([]File{{Name: "a.yaml", Data: []byte(header + `kind: ChRole
+	policy, err := Load([]File{{Name: "a.yaml", Data: []byte(header + `kind: ChRole
 metadata: {name: analytics}
 spec:
   grants:
