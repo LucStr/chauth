@@ -629,3 +629,31 @@ func TestNativePortRefusesHTTP(t *testing.T) {
 		t.Fatalf("err %v, tokens read %d, serve dialled %d; want an error and neither", err, tokens.Load(), dialled.Load())
 	}
 }
+
+// TestNativeHelloInTwoWrites sends the client Hello to the connector in two TCP segments with a
+// pause between them.
+func TestNativeHelloInTwoWrites(t *testing.T) {
+	srv := httptest.NewTLSServer(http.NotFoundHandler())
+	defer srv.Close()
+	server, hellos := fakeNative(t, srv, "", "")
+	c := New([]*Env{testEnv("prod", server, srv, staticToken("tok"))}, quiet)
+	conn, err := net.Dial("tcp", serveNative(t, c, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	var buf bytes.Buffer
+	_, _ = chwire.Hello{ClientName: "split", Major: 26, Revision: 54479, Database: "prod/core"}.WriteTo(&buf)
+	b := buf.Bytes()
+	_, _ = conn.Write(b[:len(b)/2])
+	time.Sleep(300 * time.Millisecond)
+	_, _ = conn.Write(b[len(b)/2:])
+	select {
+	case h := <-hellos:
+		if h.Database != "core" || h.Password != "tok" {
+			t.Fatalf("forwarded %+v", h)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no Hello forwarded")
+	}
+}

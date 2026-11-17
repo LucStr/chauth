@@ -1,6 +1,7 @@
 package chproxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -30,6 +31,7 @@ import (
 	"github.com/LucStr/chauth/internal/chconfig"
 	"github.com/LucStr/chauth/internal/chtest"
 	"github.com/LucStr/chauth/internal/chusers"
+	"github.com/LucStr/chauth/internal/chwire"
 	"github.com/LucStr/chauth/internal/config"
 	"github.com/LucStr/chauth/internal/rbac"
 	"github.com/LucStr/chauth/internal/telemetry"
@@ -1186,4 +1188,143 @@ func TestHTTPConnectionCap(t *testing.T) {
 		t.Fatalf("after the first closed: %v", err)
 	}
 	third.Close()
+}
+
+// ownUsers counts the users of manager m that still exist upstream.
+func ownUsers(t *testing.T, m *chusers.Manager) string {
+	return mustRoot(t, "SELECT count() FROM system.users WHERE name LIKE 'chauth\\_tmp\\_%\\_"+m.Nonce()+"%'")
+}
+
+func testInstance(hosts ...string) chconfig.Instance {
+	return chconfig.Instance{Name: "main", HTTP: "https://" + shared.HTTPS, CAFile: shared.CertFile, TLSServerName: "localhost",
+		CredentialsFile: shared.CredFile, TempUserPrefix: "chauth_tmp_", TLSMode: "verify-full", TempUserHostIPs: hosts}
+}
+
+// TestTempUserFailures: a user whose host limit excludes chauth, or whose GRANT fails, is not
+// handed out and does not stay; a drop that failed is retried by the next sweep.
+func TestTempUserFailures(t *testing.T) {
+	ctx := context.Background()
+	addr := mustRoot(t, "SELECT replaceOne(toString(address), '::ffff:', '') FROM system.processes WHERE query_id = queryID()")
+	cidr := addr + "/32"
+	if strings.Contains(addr, ":") {
+		cidr = addr + "/128"
+	}
+	key := chusers.Key{Subject: "sub-host", Email: chtest.User, Level: rbac.Read, Roles: []string{"chauth_core_read"}}
+	opts := chusers.Options{LeaseDuration: time.Minute, MaxConnectionAge: time.Hour, IdleTTL: time.Minute, ProbeTimeout: time.Second}
+	tests := []struct {
+		name  string
+		hosts []string
+		key   chusers.Key
+		ok    bool
+	}{
+		{"HOST IP includes chauth", []string{"192.0.2.0/24", cidr}, key, true},
+		{"HOST IP excludes chauth", []string{"192.0.2.0/24"}, key, false},
+		{"GRANT of a role the admin may not grant", nil, chusers.Key{Subject: "sub-grant", Email: chtest.User, Level: rbac.Read, Roles: []string{"chauth_core_read", "default_role_without_admin"}}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := testInstance(tt.hosts...)
+			admin, err := chusers.NewAdmin(in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m := chusers.NewManager(admin, in, opts)
+			defer m.Close(ctx)
+			lease, err := m.Acquire(ctx, tt.key)
+			if (err == nil) != tt.ok {
+				t.Fatalf("Acquire: %v, want ok %v", err, tt.ok)
+			}
+			if !tt.ok {
+				if n := ownUsers(t, m); n != "0" {
+					t.Fatalf("%s users left after the failed Acquire", n)
+				}
+				return
+			}
+			defer lease.Release()
+			if err := admin.Login(ctx, lease.User, lease.Password); err != nil {
+				t.Fatalf("login inside the CIDR: %v", err)
+			}
+		})
+	}
+	t.Run("failed drop retried by the sweep", func(t *testing.T) {
+		in := testInstance()
+		admin, _ := chusers.NewAdmin(in)
+		m := chusers.NewManager(admin, in, opts)
+		lease, err := m.Acquire(ctx, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lease.Release()
+		cancelled, cancel := context.WithCancel(ctx)
+		cancel()
+		m.Close(cancelled)
+		if n := ownUsers(t, m); n != "1" {
+			t.Fatalf("%s users after a failed drop, want 1", n)
+		}
+		if _, err := m.Sweep(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if n := ownUsers(t, m); n != "0" {
+			t.Fatalf("%s users after the sweep, want 0", n)
+		}
+	})
+}
+
+// TestUpstreamUnreachable: with the data ports gone a client gets 210 or 502; with the whole
+// instance gone serve is not ready and refuses with 210 or 503.
+func TestUpstreamUnreachable(t *testing.T) {
+	dead, _ := net.Listen("tcp", "127.0.0.1:0")
+	deadAddr := dead.Addr().String()
+	dead.Close()
+	tok := shared.Issuer.Token(chtest.Claims{})
+	ctx := context.Background()
+
+	h := start(t, coreRead, nil)
+	in := h.srv.instances["main"]
+	in.cfg.Native = deadAddr
+	in.httpURL, _ = url.Parse("https://" + deadAddr)
+	if _, err := h.nativeOpen(ctx, "core", tok, nil); nativeCode(err) != chwire.CodeNetworkError {
+		t.Errorf("native with the data port gone: %v, want code 210", err)
+	}
+	if status, body, _ := h.do(t, "database=core", nil, tok, "SELECT 1"); status != http.StatusBadGateway {
+		t.Errorf("http with the data port gone: %d %s, want 502", status, body)
+	}
+
+	gone := start(t, coreRead, nil)
+	gone.srv.instances["main"].admin, _ = chusers.NewAdmin(chconfig.Instance{HTTP: "https://" + deadAddr, CredentialsFile: shared.CredFile})
+	if err := gone.srv.Ready(ctx); err == nil {
+		t.Error("ready with the instance gone")
+	}
+	gone.srv.instances["main"].ready.Store(false)
+	if _, err := gone.nativeOpen(ctx, "core", tok, nil); nativeCode(err) != chwire.CodeNetworkError {
+		t.Errorf("native with the instance gone: %v, want code 210", err)
+	}
+	if status, body, _ := gone.do(t, "database=core", nil, tok, "SELECT 1"); status != http.StatusServiceUnavailable {
+		t.Errorf("http with the instance gone: %d %s, want 503", status, body)
+	}
+}
+
+// TestHelloInTwoWrites sends the client Hello in two TCP segments with a pause between them.
+func TestHelloInTwoWrites(t *testing.T) {
+	h := start(t, coreRead, nil)
+	conn, err := tls.Dial("tcp", h.native, shared.ClientTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	var buf bytes.Buffer
+	hello := chwire.Hello{ClientName: "split", Major: 26, Minor: 6, Revision: 54479, Database: "core", User: "x", Password: shared.Issuer.Token(chtest.Claims{})}
+	_, _ = hello.WriteTo(&buf)
+	b := buf.Bytes()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := conn.Write(b[:len(b)/2]); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if _, err := conn.Write(b[len(b)/2:]); err != nil {
+		t.Fatal(err)
+	}
+	if typ, err := chwire.PeekServerPacket(bufio.NewReader(conn)); err != nil || typ != chwire.ServerHello {
+		t.Fatalf("answer packet %d, %v; want the server Hello", typ, err)
+	}
 }
