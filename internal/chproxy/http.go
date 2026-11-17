@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -109,6 +110,7 @@ func (s *Server) proxyHTTP(w http.ResponseWriter, r *http.Request) {
 	rp := &httputil.ReverseProxy{
 		Transport:     in.transport,
 		FlushInterval: -1,
+		ErrorLog:      slog.NewLogLogger(s.log.Handler(), slog.LevelWarn),
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.Out.URL.Scheme, pr.Out.URL.Host = in.httpURL.Scheme, in.httpURL.Host
 			pr.Out.URL.Path = path.Join("/", in.httpURL.Path, r.URL.Path)

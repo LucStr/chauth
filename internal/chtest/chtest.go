@@ -203,6 +203,7 @@ func NewIssuer() *Issuer {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"issuer": is.srv.URL, "jwks_uri": is.srv.URL + "/jwks",
+			"authorization_endpoint": is.srv.URL + "/authorize", "token_endpoint": is.srv.URL + "/token",
 			"id_token_signing_alg_values_supported": []string{"RS256", "ES256"}})
 	})
 	mux.HandleFunc("/jwks", func(w http.ResponseWriter, _ *http.Request) {
