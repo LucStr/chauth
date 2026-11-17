@@ -47,7 +47,7 @@ instances:
     http: https://clickhouse.example.com:8443     # required: upstream HTTPS base URL
     tlsMode: verify-full                           # or verify-ca (skips the host name check only)
     # caFile: /etc/chauth/upstream-ca.pem          # default: system roots
-    # tlsServerName: clickhouse.internal           # default: the host of native / http
+    # tlsServerName: clickhouse.example.com        # default: the host of native / http
     databases: [core, otel, system]                # required: each maps to <roleTemplate> per level
     readOnlyDatabases: [system]                    # example (default none): any grant, write and "*" included, gives only the read role here
     roles: [chauth_querylog_read]                  # example (default none): upstream roles a ChRole may grant by name
