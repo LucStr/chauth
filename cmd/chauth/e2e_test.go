@@ -436,10 +436,11 @@ func TestSmoke(t *testing.T) {
 	}()
 	s.waitReady(t)
 
-	if err := nativeExec(s.local, "prod/core", "INSERT INTO core.items VALUES (21)"); err != nil {
+	id := strconv.FormatUint(uint64(time.Now().UnixNano()%(1<<31))+(1<<31), 10)
+	if err := nativeExec(s.local, "prod/core", "INSERT INTO core.items VALUES ("+id+")"); err != nil {
 		t.Errorf("native: %v", err)
 	}
-	resp, err := http.Post("http://"+s.localHTTP+"/?database="+url.QueryEscape("prod/core"), "text/plain", strings.NewReader("SELECT countIf(id = 21) FROM items"))
+	resp, err := http.Post("http://"+s.localHTTP+"/?database="+url.QueryEscape("prod/core"), "text/plain", strings.NewReader("SELECT countIf(id = "+id+") FROM items"))
 	if err != nil {
 		t.Fatal(err)
 	}
