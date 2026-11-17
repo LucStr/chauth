@@ -79,7 +79,7 @@ connects with your rights, the same trade-off as other local database proxies.
 
 ```
 docker run -v /etc/chauth:/etc/chauth -p 9440:9440 -p 8443:8443 -p 8080:8080 \
-  ghcr.io/lucstr/chauth:vX.Y.Z serve --config /etc/chauth/config.yaml
+  ghcr.io/lucstr/chauth:v0.1.0 serve --config /etc/chauth/config.yaml
 ```
 
 The image runs as non-root and needs no writable filesystem. `GET :8080/healthz` answers while the
@@ -96,6 +96,11 @@ standard `OTEL_EXPORTER_OTLP_*` variables set, spans, metrics and logs go out ov
 Binaries for macOS and Linux (amd64, arm64) are attached to each
 [release](https://github.com/LucStr/chauth/releases). A binary downloaded with a browser on macOS is
 quarantined; download it with `curl` or run `xattr -d com.apple.quarantine chauth`.
+
+```
+curl -fsSL https://github.com/LucStr/chauth/releases/download/v0.1.0/chauth_v0.1.0_darwin_arm64.tar.gz | tar -xz
+./chauth_v0.1.0_darwin_arm64/chauth version
+```
 
 ## Upstream setup
 

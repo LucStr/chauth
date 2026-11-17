@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## v0.1.0 (2026-11-17)
 
-First release, v0.1.0:
+First release.
 
 - `chauth serve`: ClickHouse's native protocol over TLS and its HTTPS interface with an OIDC access
   token as the credential. Access comes from `ChRole` / `ChRoleBinding` rules (`chauth.dev/v1alpha1`)
