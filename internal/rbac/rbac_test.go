@@ -202,7 +202,7 @@ func TestReloadWaitsForFilesToSettle(t *testing.T) {
 	if err := store.Update(files); err != nil {
 		t.Fatal(err)
 	}
-	if l, _ := store.Policy().Access(Who{User: "second@example.com"}, "main", "core"); l != Read {
+	if l := store.Policy().Grants(Who{User: "second@example.com"}, "main", Write).Databases["core"]; l != Read {
 		t.Fatalf("level = %v, want read from the settled file", l)
 	}
 }
@@ -228,8 +228,7 @@ func TestLastValidWins(t *testing.T) {
 		if s.Policy() == nil {
 			return None
 		}
-		l, _ := s.Policy().Access(Who{User: "alice@example.com"}, "main", "core")
-		return l
+		return s.Policy().Grants(Who{User: "alice@example.com"}, "main", Write).Databases["core"]
 	}
 	waitFor := func(what string, ok func() bool) {
 		t.Helper()

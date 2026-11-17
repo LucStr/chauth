@@ -120,33 +120,6 @@ type Who struct {
 	FoldUser bool
 }
 
-// Access returns the highest level any binding of who grants on instance/db, and the names of the
-// bindings that grant it.
-func (p *Policy) Access(who Who, instance, db string) (Level, []string) {
-	level := None
-	var matched []string
-	for _, b := range p.bindings {
-		if !b.matches(who) {
-			continue
-		}
-		role := p.roles[b.RoleRef]
-		if role == nil {
-			continue
-		}
-		granted := None
-		for _, g := range role.Grants {
-			if g.Instance == instance && (g.Database == "*" || g.Database == db) {
-				granted = max(granted, g.Level)
-			}
-		}
-		if granted > None {
-			matched = append(matched, b.Name)
-			level = max(level, granted)
-		}
-	}
-	return level, matched
-}
-
 func (b *Binding) matches(who Who) bool {
 	for _, s := range b.Subjects {
 		switch {

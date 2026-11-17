@@ -146,14 +146,6 @@ func (s *Server) Close(ctx context.Context) {
 	}
 }
 
-// Users is the temp-user manager of instance, nil when it is not configured.
-func (s *Server) Users(instance string) *chusers.Manager {
-	if in := s.instances[instance]; in != nil {
-		return in.users
-	}
-	return nil
-}
-
 // Failure kinds, each with its native error code and HTTP status.
 type kind int
 

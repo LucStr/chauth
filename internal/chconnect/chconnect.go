@@ -179,8 +179,6 @@ func (c *Connector) Env(name string) (*Env, bool) {
 	return e, ok
 }
 
-func (c *Connector) Names() []string { return c.names }
-
 // route picks the environment of target on a listener bound to env ("" when unbound).
 func (c *Connector) route(target, env string) (*Env, string, error) {
 	name, rest, err := connect.SplitTarget(target, env, c.names)

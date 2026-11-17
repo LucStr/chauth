@@ -405,18 +405,6 @@ func (m *Manager) Close(ctx context.Context) {
 	}
 }
 
-// Users lists the users this process holds, for tests and debugging.
-func (m *Manager) Users() []string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	out := make([]string, 0, len(m.byName))
-	for name := range m.byName {
-		out = append(out, name)
-	}
-	slices.Sort(out)
-	return out
-}
-
 var ErrBadKey = errors.New("temp user key rejected")
 
 func checkKey(k Key) error {

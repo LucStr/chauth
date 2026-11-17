@@ -31,7 +31,6 @@ func serve(args []string) error {
 	path := fs.String("config", "/etc/chauth/config.yaml", "path to the config file")
 	_ = fs.Parse(args)
 
-	log := telemetry.Logger(os.Stdout, nil)
 	cfg, err := chconfig.Load(*path)
 	if err != nil {
 		return err
@@ -43,7 +42,7 @@ func serve(args []string) error {
 		return err
 	}
 	defer shutdownTelemetry()
-	log = telemetry.Logger(os.Stdout, logs)
+	log := telemetry.Logger(os.Stdout, logs)
 
 	verifier := token.NewVerifier(cfg.OIDC)
 	store, err := rbacStore(cfg, log)

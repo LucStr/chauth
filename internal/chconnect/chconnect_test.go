@@ -375,7 +375,7 @@ func TestPrintAccess(t *testing.T) {
 		testEnv("test", "", srv, missing),
 	}, quiet)
 	var out, errOut bytes.Buffer
-	err := c.PrintAccess(context.Background(), &out, &errOut, c.Names())
+	err := c.PrintAccess(context.Background(), &out, &errOut, []string{"prod", "stage", "test"})
 	want := `DATABASE         LEVEL
 prod/core        write
 prod/main/audit  read
