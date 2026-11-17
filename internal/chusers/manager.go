@@ -237,7 +237,7 @@ func (m *Manager) forget(e *entry) {
 func (m *Manager) create(ctx context.Context, e *entry, k Key) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "CREATE USER %s IDENTIFIED WITH sha256_password BY %s VALID UNTIL %s",
-		e.name, Literal(e.password), Literal(e.validUntil.UTC().Format(time.DateTime)+" UTC"))
+		Ident(e.name), Literal(e.password), Literal(e.validUntil.UTC().Format(time.DateTime)+" UTC"))
 	if len(m.hosts) > 0 {
 		hosts := make([]string, len(m.hosts))
 		for i, h := range m.hosts {
@@ -256,9 +256,9 @@ func (m *Manager) create(ctx context.Context, e *entry, k Key) error {
 	m.live.Add(ctx, 1)
 	quoted := make([]string, len(k.Roles))
 	for i, r := range k.Roles {
-		quoted[i] = "`" + r + "`"
+		quoted[i] = Ident(r)
 	}
-	err := m.admin.Exec(ctx, "GRANT "+strings.Join(quoted, ", ")+" TO "+e.name)
+	err := m.admin.Exec(ctx, "GRANT "+strings.Join(quoted, ", ")+" TO "+Ident(e.name))
 	if err != nil {
 		err = fmt.Errorf("grant roles to temp user: %w", err)
 	} else {
@@ -293,7 +293,7 @@ func (m *Manager) probe(ctx context.Context, e *entry) error {
 func (m *Manager) drop(ctx context.Context, name string) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	if err := m.admin.Exec(ctx, "DROP USER IF EXISTS "+name); err != nil {
+	if err := m.admin.Exec(ctx, "DROP USER IF EXISTS "+Ident(name)); err != nil {
 		m.dropFailed.Add(ctx, 1)
 		m.opts.Log.Error("temp user not dropped; retried on the next sweep", "temp_user", name, "error", err)
 		m.mu.Lock()
@@ -352,7 +352,7 @@ func (m *Manager) Sweep(ctx context.Context) (int, error) {
 		m.mu.Unlock()
 		if own {
 			m.drop(ctx, name)
-		} else if err := m.admin.Exec(ctx, "DROP USER IF EXISTS "+name); err != nil {
+		} else if err := m.admin.Exec(ctx, "DROP USER IF EXISTS "+Ident(name)); err != nil {
 			m.opts.Log.Error("sweep: temp user not dropped", "temp_user", name, "error", err)
 			continue
 		} else {
@@ -423,6 +423,11 @@ func checkKey(k Key) error {
 		}
 	}
 	return nil
+}
+
+// Ident quotes s as a ClickHouse identifier.
+func Ident(s string) string {
+	return "`" + strings.NewReplacer(`\`, `\\`, "`", "\\`").Replace(s) + "`"
 }
 
 // Literal quotes s as a ClickHouse string literal.

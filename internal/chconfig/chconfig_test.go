@@ -55,6 +55,18 @@ func TestValidate(t *testing.T) {
 		{"read-only database not served", func(c *Config) { c.Instances[0].ReadOnlyDatabases = []string{"otel"} }, `readOnlyDatabases: "otel" must be unique and listed in databases`},
 		{"read-only database twice", func(c *Config) { c.Instances[0].ReadOnlyDatabases = []string{"system", "system"} }, "readOnlyDatabases"},
 		{"tiny pre-auth cap", func(c *Config) { c.Limits.PreAuthMaxBytes = 10 }, "preAuthMaxBytes"},
+		{"upper-case database", func(c *Config) { c.Instances[0].Databases = []string{"Core"} }, ""},
+		{"database starting with a digit", func(c *Config) { c.Instances[0].Databases = []string{"1core"} }, ""},
+		{"template role starting with a digit", func(c *Config) {
+			c.Instances[0].RoleTemplate = "{database}_{level}"
+			c.Instances[0].Databases = []string{"core", "1core"}
+		}, `databases: "1core" gives the role "1core_read"`},
+		{"named role with a dot", func(c *Config) { c.Instances[0].Roles = []string{"chauth.querylog"} }, `roles: "chauth.querylog"`},
+		{"mixed-case named role", func(c *Config) { c.Instances[0].Roles = []string{"Chauth_QueryLog"} }, ""},
+		{"negative reload interval", func(c *Config) { c.RBAC.ReloadInterval = -1 }, "rbac.reloadInterval must be positive"},
+		{"negative shutdown grace", func(c *Config) { c.Limits.ShutdownGrace = -1 }, "limits.shutdownGrace must be positive"},
+		{"negative pre-auth connection cap", func(c *Config) { c.Limits.MaxPreAuthConnectionsPerIP = -1 }, "maxPreAuthConnectionsPerIP must not be negative"},
+		{"negative HTTP connection cap", func(c *Config) { c.Limits.MaxHTTPConnections = -1 }, "maxHTTPConnections must not be negative"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -80,6 +92,10 @@ func TestResolve(t *testing.T) {
 		err          string
 	}{
 		{one, "", "main", "default", ""},
+		{one, "default", "main", "default", ""},
+		{one, "main/default", "main", "default", ""},
+		{two, "default", "", "", "several instances are configured"},
+		{two, "logs/default", "logs", "default", ""},
 		{one, "core", "main", "core", ""},
 		{one, "main/system", "main", "system", ""},
 		{one, "main/", "main", "default", ""},
@@ -191,5 +207,21 @@ func TestUpstreamTLS(t *testing.T) {
 				t.Fatalf("handshake err = %v, want ok %v", err, tt.ok)
 			}
 		})
+	}
+}
+
+func TestLoadRejectsZeroReloadInterval(t *testing.T) {
+	b, err := os.ReadFile("../../examples/config.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []string{"0s", "-5s"} {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(strings.Replace(string(b), "reloadInterval: 10s", "reloadInterval: "+v, 1)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "rbac.reloadInterval must be positive") {
+			t.Errorf("reloadInterval %s: err = %v", v, err)
+		}
 	}
 }

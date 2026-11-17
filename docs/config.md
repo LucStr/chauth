@@ -28,23 +28,32 @@ chauth connect   # then: clickhouse-client -d prod/core, curl localhost:8123 --d
 | `oidc.usernameCaseInsensitive` | `true` | compare `User` subjects ignoring case |
 | `oidc.groupsPrefix` | none | prepended to every group before bindings are matched |
 | `oidc.scopes.read` / `.write` | `clickhouse:read` / `clickhouse:write` | scope cap; a token with neither is refused |
-| `rbac.dir` | required | `ChRole` / `ChRoleBinding` YAML, reread every `rbac.reloadInterval` (`10s`) |
+| `rbac.dir` | required | `ChRole` / `ChRoleBinding` YAML, reread every `rbac.reloadInterval` (`10s`, must be positive) |
 | `limits.maxConnectionAge` | `12h` | a native connection is cut after this |
 | `limits.leaseDuration` | half of `maxConnectionAge` | how long one temp user is handed out |
 | `limits.tempUserIdleTTL` | `5m` | an unused temp user is dropped after this |
 | `limits.sweepInterval` | `1m` | sweep of expired temp users of any process |
 | `limits.maxConnectionsPerUser` / `maxConnectionsPerTempUser` | `50` / `20` | concurrency caps |
-| `limits.handshakeTimeout` / `preAuthMaxBytes` | `30s` / `65536` | before the token is accepted |
+| `limits.handshakeTimeout` / `preAuthMaxBytes` | `10s` / `65536` | before the token is accepted: TLS plus Hello, or TLS plus request headers |
+| `limits.maxPreAuthConnections` | `512` | native connections still before a verified token, TLS handshake included; one more is closed at once |
+| `limits.maxPreAuthConnectionsPerIP` | `0` (off) | the same per client address; leave it off behind a load balancer that rewrites source addresses, where many clients share one |
+| `limits.maxHTTPConnections` | `2048` | open connections on the HTTPS port; more wait in the kernel's accept queue |
+| `limits.shutdownGrace` | `10s` | on SIGTERM, how long running HTTP requests may finish ([shutdown](#shutdown)) |
 | `instances[].name` | required | used in grants and built-in role names; no `/` or `.` |
 | `instances[].native` / `.http` | required | upstream `host:port` (native TLS) and `https://` URL |
 | `instances[].tlsMode` | `verify-full` | or `verify-ca`; `caFile` (system roots), `tlsServerName` (the URL's host) |
 | `instances[].databases` | required | databases served; each maps through `roleTemplate` |
 | `instances[].readOnlyDatabases` | none | databases where every grant gives only the read role; each must be in `databases` |
-| `instances[].roles` | none | upstream roles a grant may name |
+| `instances[].roles` | none | upstream roles a grant may name, granted verbatim (see the warning under [Rules](#rules)) |
 | `instances[].credentialsFile` | required | `{"username", "password"}` of the admin login |
 | `instances[].tempUserPrefix` | `chauth_tmp_` | the admin's `CREATE USER, DROP USER ON <prefix>*` |
 | `instances[].tempUserHostIPs` | none | CIDRs for every temp user's `HOST IP` |
 | `instances[].roleTemplate` | `chauth_{database}_{level}` | upstream role of a database grant |
+
+Every upstream role chauth grants, named in `roles` or made by `roleTemplate` from each database and
+level, must match `^[A-Za-z_][A-Za-z0-9_]*$`; the config is refused, also by `chauth lint --config`,
+naming the database whose role does not. ClickHouse compares role names case-sensitively, so
+`databases: [Core]` needs the upstream role `chauth_Core_read`.
 
 ## Rules
 
@@ -79,7 +88,7 @@ See [`examples/rbac`](../examples/rbac).
 ## Addresses
 
 serve takes `<db>`, `<instance>/<db>` or nothing (ClickHouse's `default`; needs `<instance>/` when
-several instances are configured). The connector takes `<env>/<db>`, strips `<env>/` and forwards
+several instances are configured). `default` itself is the same as nothing, since many clients send it. The connector takes `<env>/<db>`, strips `<env>/` and forwards
 the rest. On a listener bound to an environment, a name without a known `<env>/` prefix, the empty
 one included, is in that environment ([ADR 0005](adr/0005-no-default-environment.md)).
 

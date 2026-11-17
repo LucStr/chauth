@@ -258,7 +258,7 @@ func (p *parser) role(spec *yaml.Node, name string) *Role {
 		case hasRole:
 			grant.Role = p.str(gm, "role", "spec.grants[]", g)
 			if grant.Role != "" && !ValidUpstreamRole(grant.Role) {
-				p.errorf(gm["role"], "spec.grants[].role %q must be lowercase letters, digits, '_', '-' or '.'", grant.Role)
+				p.errorf(gm["role"], "spec.grants[].role %q must be letters, digits or '_', not starting with a digit", grant.Role)
 			}
 		default:
 			grant.Database = p.str(gm, "database", "spec.grants[]", g)

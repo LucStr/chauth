@@ -244,6 +244,8 @@ func TestRoleMatrix(t *testing.T) {
 		{"write level inserts", chtest.Claims{Scope: "clickhouse:write"}, coreWrite, "core", "INSERT INTO core.items VALUES (3)", 0, 200, true},
 		{"read scope caps write binding", chtest.Claims{}, coreWrite, "core", "INSERT INTO core.items VALUES (4)", 0, 500, false},
 		{"named role on default database", chtest.Claims{}, queryLog, "", "SELECT count() FROM system.query_log", 0, 200, true},
+		{"named role on explicit default", chtest.Claims{}, queryLog, "default", "SELECT count() FROM system.query_log", 0, 200, true},
+		{"qualified explicit default", chtest.Claims{}, queryLog, "main/default", "SELECT currentDatabase() = 'default'", 0, 200, true},
 		{"named role gives no database", chtest.Claims{}, queryLog, "core", "", 497, 403, false},
 		{"database star reads every database", chtest.Claims{User: "bo@example.com", Groups: []string{"analysts"}}, allRead, "otel", "SELECT count() FROM otel.spans", 0, 200, true},
 		{"no binding", chtest.Claims{User: "bo@example.com"}, coreRead, "core", "", 497, 403, false},
@@ -996,5 +998,45 @@ func TestSetupSQLInReadme(t *testing.T) {
 	}
 	if !bytes.Contains(readme, sql) {
 		t.Error("README.md does not contain examples/clickhouse-setup.sql verbatim")
+	}
+}
+
+// TestMixedCaseDatabase serves a database whose template role has upper-case letters: every
+// statement chauth sends for it must run, with the role and user quoted.
+func TestMixedCaseDatabase(t *testing.T) {
+	for _, stmt := range []string{"CREATE DATABASE Mixed", "CREATE TABLE Mixed.t (a UInt8) ENGINE = Memory", "INSERT INTO Mixed.t VALUES (1)",
+		"CREATE ROLE chauth_Mixed_read", "GRANT SELECT ON Mixed.* TO chauth_Mixed_read", "GRANT chauth_Mixed_read TO chauth_admin WITH ADMIN OPTION"} {
+		mustRoot(t, stmt)
+	}
+	t.Cleanup(func() { mustRoot(t, "DROP ROLE IF EXISTS chauth_Mixed_read"); mustRoot(t, "DROP DATABASE IF EXISTS Mixed") })
+	h := start(t, binding("mixed", "main.Mixed.read", user(chtest.User)), func(c *chconfig.Config) {
+		c.Instances[0].Databases = append(c.Instances[0].Databases, "Mixed")
+	})
+	tok := shared.Issuer.Token(chtest.Claims{})
+	ctx := context.Background()
+	c, err := h.nativeOpen(ctx, "Mixed", tok, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n uint64
+	if err := c.QueryRow(ctx, "SELECT count() FROM t").Scan(&n); err != nil || n != 1 {
+		t.Fatalf("native: %d %v", n, err)
+	}
+	c.Close()
+	if status, body, _ := h.do(t, "database=Mixed", nil, tok, "SELECT count() FROM t"); status != 200 || body != "1" {
+		t.Fatalf("http: %d %s", status, body)
+	}
+	h.stop()
+	tmp, _ := h.audit.all("connect")[0]["temp_user"].(string)
+	mustRoot(t, "SYSTEM FLUSH LOGS")
+	got := mustRoot(t, "SELECT arrayStringConcat(groupArray(toString(type) || ' ' || replaceRegexpOne(query, 'BY .* VALID', 'BY ? VALID')), '\\n') FROM system.query_log "+
+		"WHERE user = 'chauth_admin' AND query LIKE '%"+tmp+"%' AND type != 'QueryStart'")
+	for _, want := range []string{"QueryFinish GRANT `chauth_Mixed_read` TO `chauth_tmp_", "QueryFinish CREATE USER chauth_tmp_", "QueryFinish DROP USER IF EXISTS `chauth_tmp_"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("query_log lacks %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "Exception") {
+		t.Errorf("a statement failed:\n%s", got)
 	}
 }

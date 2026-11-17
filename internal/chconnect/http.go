@@ -20,7 +20,7 @@ import (
 
 // ServeHTTP serves ClickHouse HTTP clients on ln until ctx ends; open requests then get 5 s.
 func (c *Connector) ServeHTTP(ctx context.Context, ln net.Listener, env string) error {
-	srv := &http.Server{Handler: c.HTTPHandler(env), ReadHeaderTimeout: handshakeTimeout, IdleTimeout: chapi.IdleTimeout}
+	srv := &http.Server{Handler: c.HTTPHandler(env), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: chapi.IdleTimeout}
 	go func() {
 		<-ctx.Done()
 		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

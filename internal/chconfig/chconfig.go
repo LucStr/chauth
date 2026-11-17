@@ -53,6 +53,15 @@ type Limits struct {
 	MaxConnectionsPerTempUser int             `json:"maxConnectionsPerTempUser"`
 	HandshakeTimeout          config.Duration `json:"handshakeTimeout"`
 	PreAuthMaxBytes           int             `json:"preAuthMaxBytes"`
+	// MaxPreAuthConnections caps native connections that have not yet sent a verified token;
+	// MaxPreAuthConnectionsPerIP does so per source address, 0 is off.
+	MaxPreAuthConnections      int `json:"maxPreAuthConnections"`
+	MaxPreAuthConnectionsPerIP int `json:"maxPreAuthConnectionsPerIP"`
+	// MaxHTTPConnections caps open connections on the HTTPS listener.
+	MaxHTTPConnections int `json:"maxHTTPConnections"`
+	// ShutdownGrace is how long running HTTP requests may finish on shutdown before every
+	// connection is cut and the temp users are dropped.
+	ShutdownGrace config.Duration `json:"shutdownGrace"`
 }
 
 type Instance struct {
@@ -87,6 +96,14 @@ func Load(path string) (*Config, error) {
 	if err := yaml.UnmarshalStrict(b, &c); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
+	var explicit struct {
+		RBAC struct {
+			ReloadInterval *config.Duration `json:"reloadInterval"`
+		} `json:"rbac"`
+	}
+	if err := yaml.Unmarshal(b, &explicit); err == nil && explicit.RBAC.ReloadInterval != nil && *explicit.RBAC.ReloadInterval <= 0 {
+		return nil, errors.New("rbac.reloadInterval must be positive")
+	}
 	c.ApplyDefaults()
 	if err := c.Validate(); err != nil {
 		return nil, err
@@ -120,7 +137,10 @@ func (c *Config) ApplyDefaults() {
 	setDur(&l.LeaseDuration, time.Duration(l.MaxConnectionAge)/2)
 	setDur(&l.TempUserIdleTTL, 5*time.Minute)
 	setDur(&l.SweepInterval, time.Minute)
-	setDur(&l.HandshakeTimeout, 30*time.Second)
+	setDur(&l.HandshakeTimeout, 10*time.Second)
+	setDur(&l.ShutdownGrace, 10*time.Second)
+	setInt(&l.MaxPreAuthConnections, 512)
+	setInt(&l.MaxHTTPConnections, 2048)
 	setInt(&l.MaxConnectionsPerUser, 50)
 	setInt(&l.MaxConnectionsPerTempUser, 20)
 	setInt(&l.PreAuthMaxBytes, 64<<10)
@@ -159,11 +179,21 @@ func (c *Config) Validate() error {
 			add("%s %q must be host:port", name, addr)
 		}
 	}
+	if c.RBAC.ReloadInterval <= 0 {
+		add("rbac.reloadInterval must be positive")
+	}
 	l := c.Limits
 	for name, d := range map[string]config.Duration{"maxConnectionAge": l.MaxConnectionAge, "leaseDuration": l.LeaseDuration,
-		"tempUserIdleTTL": l.TempUserIdleTTL, "sweepInterval": l.SweepInterval, "handshakeTimeout": l.HandshakeTimeout} {
+		"tempUserIdleTTL": l.TempUserIdleTTL, "sweepInterval": l.SweepInterval, "handshakeTimeout": l.HandshakeTimeout,
+		"shutdownGrace": l.ShutdownGrace} {
 		if d < 0 {
 			add("limits.%s must be positive", name)
+		}
+	}
+	for name, n := range map[string]int{"maxPreAuthConnections": l.MaxPreAuthConnections,
+		"maxPreAuthConnectionsPerIP": l.MaxPreAuthConnectionsPerIP, "maxHTTPConnections": l.MaxHTTPConnections} {
+		if n < 0 {
+			add("limits.%s must not be negative", name)
 		}
 	}
 	if l.LeaseDuration > l.MaxConnectionAge {
@@ -215,7 +245,7 @@ func (c *Config) Validate() error {
 		roles := map[string]bool{}
 		for _, r := range in.Roles {
 			if !rbac.ValidUpstreamRole(r) || roles[r] {
-				add("%s.roles: %q must be a unique lowercase role name", p, r)
+				add("%s.roles: %q must be unique letters, digits or '_', not starting with a digit", p, r)
 			}
 			roles[r] = true
 		}
@@ -229,6 +259,14 @@ func (c *Config) Validate() error {
 		}
 		if !templatePattern.MatchString(in.RoleTemplate) || !strings.Contains(in.RoleTemplate, "{database}") || !strings.Contains(in.RoleTemplate, "{level}") {
 			add("%s.roleTemplate %q must contain {database} and {level} and otherwise only letters, digits or '_'", p, in.RoleTemplate)
+		} else {
+			for _, db := range in.Databases {
+				for _, lv := range []rbac.Level{rbac.Read, rbac.Write} {
+					if r := in.RoleFor(db, lv); !rbac.ValidUpstreamRole(r) {
+						add("%s.databases: %q gives the role %q, which is not letters, digits or '_' starting with a letter or '_'", p, db, r)
+					}
+				}
+			}
 		}
 	}
 	return errors.Join(errs...)
@@ -262,11 +300,14 @@ func (c *Config) Instance(name string) (Instance, bool) {
 }
 
 // Resolve maps a target serve receives, "<instance>/<db>", "<db>" or "", to an instance and a
-// database; "" becomes DefaultDatabase and needs an instance prefix when several are configured.
+// database; "" and DefaultDatabase are the same and need an instance prefix when several are configured.
 func (c *Config) Resolve(target string) (Instance, string, error) {
 	inName, db, qualified := strings.Cut(target, "/")
 	if !qualified {
 		inName, db = "", target
+	}
+	if db == DefaultDatabase {
+		db = ""
 	}
 	if strings.Contains(db, "/") {
 		return Instance{}, "", fmt.Errorf("use <db> or <instance>/<db>, got %s", target)
