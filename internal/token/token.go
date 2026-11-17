@@ -105,7 +105,7 @@ type keySet struct {
 }
 
 func (k *keySet) VerifySignature(ctx context.Context, raw string) ([]byte, error) {
-	jws, err := jose.ParseSigned(raw, asymmetricAlgs)
+	jws, err := jose.ParseSignedCompact(raw, asymmetricAlgs)
 	if err != nil || len(jws.Signatures) != 1 {
 		return nil, errors.New("malformed token")
 	}
