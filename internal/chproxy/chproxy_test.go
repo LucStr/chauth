@@ -14,10 +14,12 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +28,9 @@ import (
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+	"go.opentelemetry.io/otel"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/LucStr/chauth/internal/chapi"
 	"github.com/LucStr/chauth/internal/chconfig"
@@ -83,14 +88,19 @@ type harness struct {
 func start(t *testing.T, rules string, mutate func(*chconfig.Config)) *harness {
 	t.Helper()
 	h := newHarness(t, rules, mutate)
-	ctx := context.Background()
 	h.srv.Start(h.ctx)
+	h.waitReady(t)
+	return h
+}
+
+func (h *harness) waitReady(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
 	for deadline := time.Now().Add(20 * time.Second); h.srv.Ready(ctx) != nil; time.Sleep(20 * time.Millisecond) {
 		if time.Now().After(deadline) {
 			t.Fatalf("not ready: %v", h.srv.Ready(ctx))
 		}
 	}
-	return h
 }
 
 // newHarness builds and serves a Server without starting its instances.
@@ -1452,7 +1462,7 @@ func TestSelfTest(t *testing.T) {
 	mustRoot(t, "GRANT chauth_noadmin TO chauth_admin")
 	t.Cleanup(func() { mustRoot(t, "DROP ROLE IF EXISTS chauth_noadmin") })
 	selfTestUsers := func(h *harness) string {
-		return mustRoot(t, "SELECT count() FROM system.users WHERE startsWith(name, 'chauth_tmp_selftest_"+h.srv.instances["main"].users.Nonce()+"')")
+		return mustRoot(t, "SELECT count() FROM system.users WHERE startsWith(name, 'chauth_tmp__selftest_"+h.srv.instances["main"].users.Nonce()+"')")
 	}
 	tests := []struct {
 		name        string
@@ -1505,4 +1515,190 @@ func TestSelfTest(t *testing.T) {
 			t.Errorf("%s self-test users left, ready lines %v", n, h.audit.all("instance ready"))
 		}
 	})
+}
+
+// TestReadinessHysteresis: a ready instance stays ready through fewer than three failed self-tests in a
+// row, turns not ready at the third without touching open connections, and is ready again after one pass.
+func TestReadinessHysteresis(t *testing.T) {
+	h := newHarness(t, coreRead, func(c *chconfig.Config) { c.Limits.SelfTestInterval = config.Duration(300 * time.Millisecond) })
+	in := h.srv.instances["main"]
+	var runs, failNext atomic.Int32
+	var failing atomic.Bool
+	selfTest := in.selfTest
+	in.selfTest = func(ctx context.Context) error {
+		runs.Add(1)
+		if failing.Load() || failNext.Add(-1) >= 0 {
+			return &chusers.StepError{Step: "create temp user", Err: errors.New("injected failure")}
+		}
+		return selfTest(ctx)
+	}
+	h.srv.Start(h.ctx)
+	h.waitReady(t)
+	ctx := context.Background()
+	tok := shared.Issuer.Token(chtest.Claims{})
+	works := func() error {
+		c, err := h.nativeOpen(ctx, "core", tok, nil)
+		if err == nil {
+			err = c.Ping(ctx)
+			c.Close()
+		}
+		if status, body, _ := h.do(t, "database=core", nil, tok, "SELECT 1"); err == nil && status != 200 {
+			err = fmt.Errorf("http %d %s", status, body)
+		}
+		return err
+	}
+
+	failNext.Store(1)
+	until := runs.Load() + 3
+	for runs.Load() < until {
+		if err := h.srv.Ready(ctx); err != nil {
+			t.Fatalf("one failed self-test made the instance not ready: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err := works(); err != nil {
+		t.Fatalf("after one failed self-test: %v", err)
+	}
+
+	open, err := h.nativeOpen(ctx, "core", tok, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer open.Close()
+	inflight := make(chan string, 1)
+	go func() {
+		req, _ := http.NewRequest(http.MethodPost, h.url+"/?database=core", strings.NewReader("SELECT sum(sleepEachRow(1)) FROM numbers(6) SETTINGS max_block_size = 1"))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		resp, err := httpClient().Do(req)
+		if err != nil {
+			inflight <- err.Error()
+			return
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		inflight <- fmt.Sprint(resp.StatusCode, " ", strings.TrimSpace(string(b)))
+	}()
+	time.Sleep(200 * time.Millisecond)
+	failing.Store(true)
+	waitFor(t, "not ready after three failures", func() bool { return h.srv.Ready(ctx) != nil })
+	if _, err := h.nativeOpen(ctx, "core", tok, nil); nativeCode(err) != chwire.CodeNetworkError {
+		t.Errorf("new native connection while not ready: %v, want code 210", err)
+	}
+	if status, _, _ := h.do(t, "database=core", nil, tok, "SELECT 1"); status != http.StatusServiceUnavailable {
+		t.Errorf("new HTTP request while not ready: %d, want 503", status)
+	}
+	if err := open.Ping(ctx); err != nil {
+		t.Errorf("open native connection while not ready: %v", err)
+	}
+	failing.Store(false)
+	recovering := time.Now()
+	waitFor(t, "ready again", func() bool { return h.srv.Ready(ctx) == nil })
+	if d := time.Since(recovering); d > 6*time.Second {
+		t.Errorf("ready again after %v, want within about 5s", d)
+	}
+	if got := <-inflight; got != "200 0" {
+		t.Errorf("in-flight query: %s, want 200 0", got)
+	}
+	down := h.audit.all("instance not ready")
+	if len(down) != 1 || down[0]["step"] != "self-test: create temp user" || down[0]["error"] != "injected failure" || down[0]["failures"] != float64(3) {
+		t.Errorf("not-ready lines %v, want one naming the third failure", down)
+	}
+	if n := len(h.audit.all("instance ready")); n != 2 {
+		t.Errorf("%d ready lines, want 2", n)
+	}
+}
+
+// TestPasswordNeverInURL: a temp user's password reaches ClickHouse's HTTP interface only as Basic
+// auth, on create, the first login and the query cancel.
+func TestPasswordNeverInURL(t *testing.T) {
+	var mu sync.Mutex
+	var urls, passwords []string
+	upstream, _ := url.Parse("http://" + shared.PlainHTTP)
+	proxy := httputil.NewSingleHostReverseProxy(upstream)
+	rec := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, pass, _ := r.BasicAuth()
+		mu.Lock()
+		urls, passwords = append(urls, r.URL.String()), append(passwords, pass)
+		mu.Unlock()
+		proxy.ServeHTTP(w, r)
+	}))
+	defer rec.Close()
+	in := testInstance()
+	in.HTTP = rec.URL
+	admin, err := chusers.NewAdmin(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	m := chusers.NewManager(admin, in, chusers.Options{LeaseDuration: time.Minute, MaxConnectionAge: time.Hour, IdleTTL: time.Minute})
+	defer m.Close(ctx)
+	lease, err := m.Acquire(ctx, chusers.Key{Subject: "sub-url", Email: chtest.User, Level: rbac.Read, Roles: []string{"chauth_core_read"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if err := admin.CancelQuery(ctx, lease.User, lease.Password, "no-such-query"); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Contains(passwords, lease.Password) {
+		t.Errorf("password never sent as Basic auth")
+	}
+	for _, u := range urls {
+		if strings.Contains(u, lease.Password) || strings.Contains(u, url.QueryEscape(lease.Password)) || strings.Contains(u, url.PathEscape(lease.Password)) {
+			t.Errorf("password in URL %s", u)
+		}
+	}
+}
+
+// TestSelfTestMetrics: self-tests count only in chauth.selftest.runs, never in the temp-user metrics.
+func TestSelfTestMetrics(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	prev := otel.GetMeterProvider()
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
+	t.Cleanup(func() { otel.SetMeterProvider(prev) })
+	in := testInstance()
+	admin, err := chusers.NewAdmin(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	opts := chusers.Options{LeaseDuration: time.Minute, MaxConnectionAge: time.Hour, IdleTTL: time.Minute}
+	m := chusers.NewManager(admin, in, opts)
+	defer m.Close(ctx)
+	opts.Password = func() string { return "abcdefghijklmnopqrstuvwxyz012345" }
+	weak := chusers.NewManager(admin, in, opts)
+	lease, err := m.Acquire(ctx, chusers.Key{Subject: "sub-metrics", Email: chtest.User, Level: rbac.Read, Roles: []string{"chauth_core_read"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if err := m.SelfTest(ctx, []string{"chauth_core_read"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := weak.SelfTest(ctx, []string{"chauth_core_read"}); err == nil {
+		t.Fatal("self-test with a weak password passed")
+	}
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &rm); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]int64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, mt := range sm.Metrics {
+			if sum, ok := mt.Data.(metricdata.Sum[int64]); ok {
+				for _, dp := range sum.DataPoints {
+					result, _ := dp.Attributes.Value("result")
+					got[strings.TrimSuffix(mt.Name+" "+result.AsString(), " ")] += dp.Value
+				}
+			}
+		}
+	}
+	want := map[string]int64{"chauth.users.created": 1, "chauth.users.live": 1, "chauth.selftest.runs pass": 1, "chauth.selftest.runs fail": 1}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s = %d, want %d (all: %v)", k, got[k], v, got)
+		}
+	}
 }

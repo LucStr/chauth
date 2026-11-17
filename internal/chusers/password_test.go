@@ -27,3 +27,18 @@ func TestPassword(t *testing.T) {
 		}
 	}
 }
+
+// TestNames: no subject gives a person's temp user the self-test user's shape, and both keep the
+// prefix the admin's CREATE USER grant and the sweep match.
+func TestNames(t *testing.T) {
+	m := &Manager{prefix: "chauth_tmp_", nonce: "abcdef"}
+	for _, sub := range []string{"selftest", "selftest_x", "_selftest", "__", "Self_Test-1", "", "üñî"} {
+		user, self := m.userName(sub), m.selfTestName()
+		if !strings.HasPrefix(user, m.prefix) || strings.HasPrefix(user, m.prefix+"_") || !validName(user) {
+			t.Errorf("subject %q: user %q", sub, user)
+		}
+		if !strings.HasPrefix(self, m.prefix+"_selftest_"+m.nonce) || !validName(self) {
+			t.Errorf("self-test user %q", self)
+		}
+	}
+}

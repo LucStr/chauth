@@ -55,6 +55,7 @@ type instance struct {
 	ready     atomic.Bool
 	admin     *chusers.Admin
 	users     *chusers.Manager
+	selfTest  func(context.Context) error
 	httpURL   *url.URL
 	transport *http.Transport
 }
@@ -82,7 +83,7 @@ func New(cfg *chconfig.Config, verifier *token.Verifier, store *rbac.Store, tlsC
 		if err != nil {
 			return nil, fmt.Errorf("instance %s: %w", in.Name, err)
 		}
-		s.instances[in.Name] = &instance{
+		inst := &instance{
 			cfg: in, admin: admin, httpURL: u,
 			transport: &http.Transport{TLSClientConfig: upTLS, MaxIdleConnsPerHost: 64, IdleConnTimeout: time.Minute, DisableCompression: true},
 			users: chusers.NewManager(admin, in, chusers.Options{
@@ -90,22 +91,32 @@ func New(cfg *chconfig.Config, verifier *token.Verifier, store *rbac.Store, tlsC
 				IdleTTL: time.Duration(l.TempUserIdleTTL), MaxRefs: l.MaxConnectionsPerTempUser, Log: log,
 			}),
 		}
+		roles := in.GrantableRoles()
+		inst.selfTest = func(ctx context.Context) error { return inst.users.SelfTest(ctx, roles) }
+		s.instances[in.Name] = inst
 	}
 	return s, nil
 }
 
 // Start makes each instance ready once the admin login, a sweep of expired temp users and a self-test
-// pass, retrying with backoff; the self-test then repeats every selfTestInterval and gates readiness.
+// pass; the self-test then repeats every selfTestInterval and gates readiness.
 func (s *Server) Start(ctx context.Context) {
 	for _, in := range s.instances {
 		go s.watch(ctx, in)
 	}
 }
 
+const (
+	// failuresToUnready consecutive failed checks make a ready instance not ready.
+	failuresToUnready = 3
+	maxRetryWait      = 5 * time.Second
+)
+
+// watch checks in until ctx ends: not ready until the first pass, then not ready only after
+// failuresToUnready failures in a row, retried a second apart; one pass makes it ready again.
 func (s *Server) watch(ctx context.Context, in *instance) {
-	roles := in.cfg.GrantableRoles()
 	interval := time.Duration(s.cfg.Limits.SelfTestInterval)
-	swept, state := -1, ""
+	swept, fails, logged := -1, 0, ""
 	for wait := time.Second; ; {
 		step, err := "admin login", in.admin.Ping(ctx)
 		if err == nil && swept < 0 {
@@ -117,7 +128,7 @@ func (s *Server) watch(ctx context.Context, in *instance) {
 			}
 		}
 		if err == nil {
-			step, err = "self-test", in.users.SelfTest(ctx, roles)
+			step, err = "self-test", in.selfTest(ctx)
 			if se := (*chusers.StepError)(nil); errors.As(err, &se) {
 				step, err = "self-test: "+se.Step, se.Err
 			}
@@ -126,18 +137,24 @@ func (s *Server) watch(ctx context.Context, in *instance) {
 			return
 		}
 		next := interval
-		if err == nil {
+		switch {
+		case err == nil:
+			fails, wait = 0, time.Second
 			in.ready.Store(true)
-			if state != "ready" {
-				s.log.Info("instance ready", "instance", in.cfg.Name, "swept", swept, "roles", roles, "pod", in.users.Nonce())
+			if logged != "ready" {
+				logged = "ready"
+				s.log.Info("instance ready", "instance", in.cfg.Name, "roles", in.cfg.GrantableRoles(), "swept", swept, "pod", in.users.Nonce())
 			}
-			state, wait = "ready", time.Second
-		} else {
+		case logged == "ready" && fails+1 < failuresToUnready:
+			fails, next = fails+1, time.Second
+		default:
+			fails++
 			in.ready.Store(false)
-			if state != step {
-				s.log.Warn("instance not ready", "instance", in.cfg.Name, "step", step, "error", err)
+			if logged != "not ready" {
+				logged = "not ready"
+				s.log.Warn("instance not ready", "instance", in.cfg.Name, "step", step, "error", err, "failures", fails)
 			}
-			state, next, wait = step, min(wait, interval), min(2*wait, 30*time.Second)
+			next, wait = min(wait, interval), min(2*wait, maxRetryWait)
 		}
 		select {
 		case <-ctx.Done():
