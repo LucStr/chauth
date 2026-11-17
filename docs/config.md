@@ -173,6 +173,9 @@ example: [`examples/connect.yaml`](../examples/connect.yaml).
   no default environment.
 - `listeners: [{listen, listenHTTP, env}]`: local ports bound to an environment; either address may
   be left out. A bound listener on the top-level address takes it over.
+- The browser login runs on `chauth login <env>` and on the first native connection without a stored
+  login; the HTTP port never starts one and answers 401 naming `chauth login <env>`. The HTTP port
+  refuses requests from web pages ([ADR 0004](adr/0004-tokens-from-login-or-file.md)).
 - `callbackPort` (default `8250`): loopback port of the browser login redirect; `0` picks a free one.
 
 Every local address must be a loopback address: the connector serves this machine only.
