@@ -21,10 +21,13 @@ import (
 )
 
 // TestUnknownKeyRefetch: tokens signed by keys the issuer does not publish fetch the key set at
-// most once per refetchEvery; a key the issuer adds is picked up at the next allowed fetch.
+// most once per refetchEvery; a key the issuer adds is picked up at the next allowed fetch, and a
+// failed fetch is retried after retryAfter, not after a whole window.
 func TestUnknownKeyRefetch(t *testing.T) {
 	known, _ := rsa.GenerateKey(rand.Reader, 2048)
 	added, _ := rsa.GenerateKey(rand.Reader, 2048)
+	third, _ := rsa.GenerateKey(rand.Reader, 2048)
+	var failNext atomic.Bool
 	var mu sync.Mutex
 	published := []jose.JSONWebKey{{Key: &known.PublicKey, KeyID: "k1", Algorithm: "RS256", Use: "sig"}}
 	var fetches atomic.Int32
@@ -36,6 +39,10 @@ func TestUnknownKeyRefetch(t *testing.T) {
 				"id_token_signing_alg_values_supported": []string{"RS256", "HS256"}})
 		case "/jwks":
 			fetches.Add(1)
+			if failNext.Swap(false) {
+				http.Error(w, "unavailable", http.StatusServiceUnavailable)
+				return
+			}
 			mu.Lock()
 			defer mu.Unlock()
 			_ = json.NewEncoder(w).Encode(jose.JSONWebKeySet{Keys: published})
@@ -82,6 +89,20 @@ func TestUnknownKeyRefetch(t *testing.T) {
 			mu.Unlock()
 		}, sign(added, "k2"), false, 2},
 		{"rotated key after it", age, sign(added, "k2"), true, 3},
+		{"rotation while the issuer fails", func() {
+			mu.Lock()
+			published = append(published, jose.JSONWebKey{Key: &third.PublicKey, KeyID: "k3", Algorithm: "RS256", Use: "sig"})
+			mu.Unlock()
+			failNext.Store(true)
+			age()
+		}, sign(third, "k3"), false, 4},
+		{"within the retry backoff", nil, sign(third, "k3"), false, 4},
+		{"after the retry backoff", func() {
+			k := v.keys.Load()
+			k.mu.Lock()
+			k.failedAt = k.failedAt.Add(-retryAfter - 100*time.Millisecond)
+			k.mu.Unlock()
+		}, sign(third, "k3"), true, 5},
 	}
 	for _, s := range steps {
 		if s.before != nil {

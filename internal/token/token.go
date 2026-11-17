@@ -92,16 +92,26 @@ var asymmetricAlgs = []jose.SignatureAlgorithm{jose.RS256, jose.RS384, jose.RS51
 // refetchEvery bounds how often a token signed by an unknown key makes chauth fetch the key set.
 const refetchEvery = 10 * time.Second
 
+// retryAfter is how soon a failed key-set fetch may be tried again.
+const retryAfter = time.Second
+
 // keySet is the issuer's JWKS. A token whose key is not in it triggers at most one fetch per
-// every; tokens in between fail without one, so unauthenticated clients cannot drive fetches.
+// every after a successful fetch, or retryAfter after a failed one; tokens in between fail
+// without one, so unauthenticated clients cannot drive fetches.
 type keySet struct {
 	url   string
 	every time.Duration
 
-	fetchMu   sync.Mutex
 	mu        sync.Mutex
 	keys      []jose.JSONWebKey
 	fetchedAt time.Time
+	failedAt  time.Time
+	inflight  bool
+}
+
+// due reports whether a fetch may start now; k.mu must be held.
+func (k *keySet) due() bool {
+	return !k.inflight && time.Since(k.fetchedAt) >= k.every && time.Since(k.failedAt) >= retryAfter
 }
 
 func (k *keySet) VerifySignature(ctx context.Context, raw string) ([]byte, error) {
@@ -112,12 +122,6 @@ func (k *keySet) VerifySignature(ctx context.Context, raw string) ([]byte, error
 	kid := jws.Signatures[0].Header.KeyID
 	if payload, ok := k.verify(jws, kid); ok {
 		return payload, nil
-	}
-	k.mu.Lock()
-	due := time.Since(k.fetchedAt) >= k.every
-	k.mu.Unlock()
-	if !due {
-		return nil, errors.New("failed to verify signature")
 	}
 	if err := k.fetch(ctx); err != nil {
 		return nil, fmt.Errorf("fetch keys: %w", err)
@@ -142,38 +146,47 @@ func (k *keySet) verify(jws *jose.JSONWebSignature, kid string) ([]byte, bool) {
 	return nil, false
 }
 
-// fetch replaces the keys unless they were fetched within every; verification goes on meanwhile.
+// fetch replaces the keys when a fetch is due and returns nil when it is not.
 func (k *keySet) fetch(ctx context.Context) error {
-	k.fetchMu.Lock()
-	defer k.fetchMu.Unlock()
 	k.mu.Lock()
-	recent := !k.fetchedAt.IsZero() && time.Since(k.fetchedAt) < k.every
-	if !recent {
-		k.fetchedAt = time.Now()
-	}
-	k.mu.Unlock()
-	if recent {
+	if !k.due() {
+		k.mu.Unlock()
 		return nil
 	}
+	k.inflight = true
+	k.mu.Unlock()
+	keys, err := k.get(ctx)
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.inflight = false
+	if err != nil {
+		k.failedAt = time.Now()
+		return err
+	}
+	k.keys, k.fetchedAt, k.failedAt = keys, time.Now(), time.Time{}
+	return nil
+}
+
+func (k *keySet) get(ctx context.Context) ([]jose.JSONWebKey, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, k.url, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("GET %s: %s", k.url, resp.Status)
+		return nil, fmt.Errorf("GET %s: %s", k.url, resp.Status)
 	}
 	var set struct {
 		Keys []json.RawMessage `json:"keys"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&set); err != nil {
-		return fmt.Errorf("GET %s: %w", k.url, err)
+		return nil, fmt.Errorf("GET %s: %w", k.url, err)
 	}
 	var keys []jose.JSONWebKey
 	for _, raw := range set.Keys {
@@ -182,10 +195,7 @@ func (k *keySet) fetch(ctx context.Context) error {
 			keys = append(keys, key)
 		}
 	}
-	k.mu.Lock()
-	k.keys = keys
-	k.mu.Unlock()
-	return nil
+	return keys, nil
 }
 
 // Ready reports whether discovery and the first JWKS fetch succeeded.
