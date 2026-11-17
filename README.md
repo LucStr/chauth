@@ -190,6 +190,11 @@ config: [`docs/config.md`](docs/config.md).
   with chauth alone and limit it by `HOST IP`.
 - The connector listens only on loopback addresses and never runs a configured command: tokens come
   from a browser login or a file ([ADR 0004](docs/adr/0004-tokens-from-login-or-file.md)).
+- The connector's HTTP port refuses web pages: a request with an `Origin` header, a `Sec-Fetch-Site`
+  other than `none`, or a `Host` other than `localhost` or a loopback IP with the port (DNS
+  rebinding) gets 403 before a token is read. `add_http_cors_header` is removed and `Access-Control-*`
+  answers are dropped by the connector and by serve. The HTTP port never opens a browser login; run
+  `chauth login <env>` first (the native port logs in on first use).
 
 ## Development
 

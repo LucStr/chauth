@@ -3,7 +3,12 @@ package connect
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -147,6 +152,65 @@ func TestValidate(t *testing.T) {
 		}
 		if _, err := LoadFile(path); err == nil || !strings.Contains(err.Error(), "unknown field") {
 			t.Errorf("%s: err = %v, want an unknown field", name, err)
+		}
+	}
+}
+
+func TestAccessExpiry(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	tests := []struct {
+		name string
+		tok  tokenResponse
+		want time.Time
+	}{
+		{"expires_in", tokenResponse{AccessToken: jwtExpiring(now.Add(time.Hour)), ExpiresIn: 300}, now.Add(5 * time.Minute)},
+		{"exp claim", tokenResponse{AccessToken: jwtExpiring(now.Add(time.Hour))}, now.Add(time.Hour)},
+		{"opaque token", tokenResponse{AccessToken: "opaque"}, now.Add(unknownLifetime)},
+		{"JWT without exp", tokenResponse{AccessToken: "e30." + base64.RawURLEncoding.EncodeToString([]byte(`{}`)) + ".sig"}, now.Add(unknownLifetime)},
+	}
+	for _, tt := range tests {
+		if got := accessExpiry(&tt.tok, now); !got.Equal(tt.want) {
+			t.Errorf("%s: %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
+
+type memStore map[string]string
+
+func (m memStore) Get(k string) (string, error) { return m[k], nil }
+func (m memStore) Set(k, v string) error        { m[k] = v; return nil }
+func (m memStore) Delete(k string) error        { delete(m, k); return nil }
+
+// TestTokenWithoutLogin: without a stored refresh token only Token opens the browser.
+func TestTokenWithoutLogin(t *testing.T) {
+	issuer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/.well-known/openid-configuration":
+			fmt.Fprintf(w, `{"authorization_endpoint":"http://%s/authorize","token_endpoint":"http://%s/token"}`, r.Host, r.Host)
+		case "/token":
+			_ = r.ParseForm()
+			if r.PostForm.Get("refresh_token") != "good" {
+				http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
+				return
+			}
+			fmt.Fprintf(w, `{"access_token":%q}`, jwtExpiring(time.Now().Add(time.Hour)))
+		}
+	}))
+	defer issuer.Close()
+	for _, tt := range []struct {
+		name, stored string
+		wantErr      error
+	}{
+		{"no stored login", "", ErrLoginRequired},
+		{"refresh refused", "revoked", ErrLoginRequired},
+		{"refresh works", "good", nil},
+	} {
+		opened := 0
+		c := New(Options{Issuer: issuer.URL, ClientID: "cli", CallbackPort: 0, Store: memStore{"k": tt.stored}, StoreKey: "k",
+			OpenBrowser: func(string) error { opened++; return nil }}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		tok, err := c.TokenWithoutLogin(context.Background())
+		if !errors.Is(err, tt.wantErr) || opened != 0 || (err == nil) != (tok != "") {
+			t.Errorf("%s: token %q, err %v, browser opened %d times", tt.name, tok, err, opened)
 		}
 	}
 }

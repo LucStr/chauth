@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -282,7 +283,8 @@ func TestHTTP(t *testing.T) {
 		{"bound, no database at all", bound, "", nil, url.Values{}, "", "Bearer tok-prod", 200},
 		{"bound, other env explicitly", bound, "?database=test/core", nil, url.Values{"database": {"core"}}, "", "Bearer tok-test", 200},
 		{"unbound, no database", unbound, "", nil, nil, "", "", 400},
-		{"database twice", unbound, "?database=prod/core", http.Header{"X-Clickhouse-Database": {"prod/core"}}, nil, "", "", 400},
+		{"parameter and header disagree", unbound, "?database=prod/core", http.Header{"X-Clickhouse-Database": {"prod/otel"}}, nil, "", "", 400},
+		{"parameter twice in other case", unbound, "?database=prod/core&DATABASE=prod/core", nil, nil, "", "", 400},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -470,5 +472,160 @@ func TestHTTPNoReplay(t *testing.T) {
 	}
 	if seen.Load() != 2 || statuses[0] != 200 || statuses[1] != http.StatusBadGateway {
 		t.Fatalf("server saw %d requests, statuses %v; want 2 and [200 502]", seen.Load(), statuses)
+	}
+}
+
+// upstreamRecorder is a fake serve that records each request's raw query and headers and answers
+// with a CORS header, as ClickHouse does for add_http_cors_header=1.
+func upstreamRecorder(t *testing.T) (*httptest.Server, chan *http.Request) {
+	got := make(chan *http.Request, 10)
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got <- r.Clone(context.Background())
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		_, _ = io.WriteString(w, "1\n")
+	}))
+	t.Cleanup(srv.Close)
+	return srv, got
+}
+
+func TestHTTPRefusesBrowsers(t *testing.T) {
+	srv, got := upstreamRecorder(t)
+	var tokens atomic.Int32
+	c := New([]*Env{testEnv("prod", "", srv, countingToken{&tokens})}, quiet)
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = c.ServeHTTP(ctx, ln, "prod") }()
+	port := strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
+	tests := []struct {
+		name, host string
+		header     http.Header
+		status     int
+	}{
+		{"plain client", "127.0.0.1:" + port, nil, 200},
+		{"localhost", "LocalHost:" + port, nil, 200},
+		{"IPv6 loopback", "[::1]:" + port, nil, 200},
+		{"address-bar navigation", "localhost:" + port, http.Header{"Sec-Fetch-Site": {"none"}}, 200},
+		{"cross-site fetch", "127.0.0.1:" + port, http.Header{"Origin": {"https://evil.example"}}, 403},
+		{"null origin", "127.0.0.1:" + port, http.Header{"Origin": {"null"}}, 403},
+		{"same-origin fetch", "127.0.0.1:" + port, http.Header{"Sec-Fetch-Site": {"same-origin"}}, 403},
+		{"cross-site navigation", "127.0.0.1:" + port, http.Header{"Sec-Fetch-Site": {"cross-site"}}, 403},
+		{"rebinding host name", "rebind.evil.example:" + port, nil, 403},
+		{"loopback name other than localhost", "localhost.localdomain:" + port, nil, 403},
+		{"other port", "127.0.0.1:1", nil, 403},
+		{"no port", "127.0.0.1", nil, 403},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			before := tokens.Load()
+			req, _ := http.NewRequest(http.MethodPost, "http://"+ln.Addr().String()+"/?database=core&add_http_cors_header=1", strings.NewReader("SELECT 1"))
+			req.Host = tt.host
+			for k, v := range tt.header {
+				req.Header[k] = v
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _ = io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != tt.status || resp.Header.Get("Access-Control-Allow-Origin") != "" {
+				t.Fatalf("status %d, ACAO %q; want %d and none", resp.StatusCode, resp.Header.Get("Access-Control-Allow-Origin"), tt.status)
+			}
+			if tt.status != 200 {
+				if tokens.Load() != before || len(got) != 0 {
+					t.Fatal("a refused request read a token or reached serve")
+				}
+				return
+			}
+			up := <-got
+			if up.URL.RawQuery != "database=core" || up.Header.Get("Origin") != "" || up.Header.Get("Sec-Fetch-Site") != "" {
+				t.Fatalf("serve saw %q %v", up.URL.RawQuery, up.Header)
+			}
+		})
+	}
+	t.Run("loopbackHost on port 80", func(t *testing.T) {
+		at80 := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 80}
+		for host, want := range map[string]bool{"localhost": true, "127.0.0.1": true, "[::1]": true, "::1": false, "evil.example": false, "127.0.0.1:80": true} {
+			if loopbackHost(host, at80) != want {
+				t.Errorf("%q: want %v", host, want)
+			}
+		}
+	})
+}
+
+// TestHTTPRawQuery: every pair the connector does not own reaches serve as sent and in order.
+func TestHTTPRawQuery(t *testing.T) {
+	srv, got := upstreamRecorder(t)
+	c := New([]*Env{testEnv("prod", "", srv, staticToken("tok"))}, quiet)
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = c.ServeHTTP(ctx, ln, "") }()
+	tests := []struct {
+		name, in, out string
+		header        http.Header
+		status        int
+	}{
+		{"order and encoding kept", "z=1&DataBase=prod/core&param_x=a;b&a=%2B+&q=SELECT%201", "z=1&param_x=a;b&a=%2B+&q=SELECT%201&database=core", nil, 200},
+		{"credentials and CORS in any case", "User=a&PASSWORD=b&%75ser=c&Add_Http_Cors_Header=1&database=prod/core", "database=core", nil, 200},
+		{"database as header, kept as header", "x=1", "x=1", http.Header{"X-Clickhouse-Database": {"prod/core"}}, 200},
+		{"parameter and header agree", "database=prod/core&x=1", "x=1&database=core", http.Header{"X-Clickhouse-Database": {"prod/core"}}, 200},
+		{"named twice", "database=prod/core&Database=prod/core", "", nil, 400},
+		{"bad escape", "%zz=1&database=prod/core", "", nil, 400},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, _ := http.NewRequest(http.MethodPost, "http://"+ln.Addr().String()+"/", strings.NewReader("SELECT 1"))
+			req.URL.RawQuery = tt.in
+			for k, v := range tt.header {
+				req.Header[k] = v
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != tt.status {
+				t.Fatalf("status %d, want %d", resp.StatusCode, tt.status)
+			}
+			if tt.status == 200 {
+				if up := <-got; up.URL.RawQuery != tt.out {
+					t.Fatalf("serve saw %q, want %q", up.URL.RawQuery, tt.out)
+				}
+			}
+		})
+	}
+}
+
+type countingToken struct{ n *atomic.Int32 }
+
+func (c countingToken) Token(context.Context) (string, error) { c.n.Add(1); return "tok", nil }
+
+// TestNativePortRefusesHTTP: an HTTP request to the native port, as a web page could send, is refused
+// before a token is read or serve is dialled.
+func TestNativePortRefusesHTTP(t *testing.T) {
+	srv := httptest.NewTLSServer(http.NotFoundHandler())
+	defer srv.Close()
+	up, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer up.Close()
+	var dialled, tokens atomic.Int32
+	go func() {
+		for {
+			conn, err := up.Accept()
+			if err != nil {
+				return
+			}
+			dialled.Add(1)
+			conn.Close()
+		}
+	}()
+	c := New([]*Env{testEnv("prod", up.Addr().String(), srv, countingToken{&tokens})}, quiet)
+	addr := serveNative(t, c, "prod")
+	req, _ := http.NewRequest(http.MethodPost, "http://"+addr+"/?database=core", strings.NewReader("SELECT 1"))
+	req.Header.Set("Origin", "https://evil.example")
+	_, err := http.DefaultClient.Do(req)
+	if err == nil || tokens.Load() != 0 || dialled.Load() != 0 {
+		t.Fatalf("err %v, tokens read %d, serve dialled %d; want an error and neither", err, tokens.Load(), dialled.Load())
 	}
 }

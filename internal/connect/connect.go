@@ -85,8 +85,18 @@ func (c *Connector) Login(ctx context.Context) error {
 	return err
 }
 
+// ErrLoginRequired is returned by TokenWithoutLogin when only a browser login could give a token.
+var ErrLoginRequired = errors.New("browser login required")
+
 // Token returns a database token valid for at least accessMargin, refreshing or logging in as needed.
-func (c *Connector) Token(ctx context.Context) (string, error) {
+func (c *Connector) Token(ctx context.Context) (string, error) { return c.token(ctx, true) }
+
+// TokenWithoutLogin is Token without the browser login: it uses the cached or refreshed token only.
+func (c *Connector) TokenWithoutLogin(ctx context.Context) (string, error) {
+	return c.token(ctx, false)
+}
+
+func (c *Connector) token(ctx context.Context, interactive bool) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.access != "" && time.Until(c.accessExp) > accessMargin {
@@ -108,16 +118,19 @@ func (c *Connector) Token(ctx context.Context) (string, error) {
 	if refreshToken != "" {
 		tok, err = c.refresh(ctx, c.disc, refreshToken)
 		if err != nil {
-			c.log.Info("refresh failed, logging in again", "error", err)
+			c.log.Info("refresh failed", "error", err, "browser_login", interactive)
 		}
 	}
 	if tok == nil {
+		if !interactive {
+			return "", ErrLoginRequired
+		}
 		if tok, err = c.login(ctx, c.disc); err != nil {
 			return "", err
 		}
 	}
 	c.access = tok.AccessToken
-	c.accessExp = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
+	c.accessExp = accessExpiry(tok, time.Now())
 	if tok.RefreshToken != "" {
 		c.refreshed = tok.RefreshToken
 		if err := c.opts.Store.Set(c.opts.StoreKey, tok.RefreshToken); err != nil {
@@ -125,4 +138,18 @@ func (c *Connector) Token(ctx context.Context) (string, error) {
 		}
 	}
 	return c.access, nil
+}
+
+// unknownLifetime is assumed for an access token whose response and claims name no expiry.
+const unknownLifetime = time.Minute
+
+// accessExpiry is from expires_in, else from the access token's exp claim, else unknownLifetime from now.
+func accessExpiry(tok *tokenResponse, now time.Time) time.Time {
+	if tok.ExpiresIn > 0 {
+		return now.Add(time.Duration(tok.ExpiresIn) * time.Second)
+	}
+	if exp, err := expiry(tok.AccessToken); err == nil && !exp.IsZero() {
+		return exp
+	}
+	return now.Add(unknownLifetime)
 }

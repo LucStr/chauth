@@ -3,9 +3,12 @@
 package chapi
 
 import (
+	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
+	"time"
 )
 
 const (
@@ -64,4 +67,66 @@ func NoReplay(out *http.Request) {
 		out.Body = io.NopCloser(strings.NewReader(""))
 	}
 	out.GetBody = nil
+}
+
+// IdleTimeout closes a kept-alive client connection that sends no next request.
+const IdleTimeout = 2 * time.Minute
+
+// CORSParam makes ClickHouse answer with Access-Control-Allow-Origin; neither proxy forwards it.
+const CORSParam = "add_http_cors_header"
+
+// FilterQuery splits raw on '&' and keeps every pair whose decoded key drop rejects, byte-for-byte
+// and in order; it returns the decoded values of the dropped pairs whose key equals target in any case.
+func FilterQuery(raw, target string, drop func(key string) bool) (string, []string, error) {
+	var kept, values []string
+	for _, part := range strings.Split(raw, "&") {
+		if part == "" {
+			continue
+		}
+		rawKey, rawValue, _ := strings.Cut(part, "=")
+		key, err := url.QueryUnescape(rawKey)
+		if err != nil {
+			return "", nil, fmt.Errorf("bad query parameter %q", rawKey)
+		}
+		if strings.EqualFold(key, target) {
+			v, err := url.QueryUnescape(rawValue)
+			if err != nil {
+				return "", nil, fmt.Errorf("bad %s parameter", target)
+			}
+			values = append(values, v)
+			continue
+		}
+		if !drop(key) {
+			kept = append(kept, part)
+		}
+	}
+	return strings.Join(kept, "&"), values, nil
+}
+
+// OneOf reports whether key equals one of names, ignoring case.
+func OneOf(key string, names ...string) bool {
+	for _, n := range names {
+		if strings.EqualFold(key, n) {
+			return true
+		}
+	}
+	return false
+}
+
+// AppendParam adds key=value to a raw query.
+func AppendParam(query, key, value string) string {
+	p := url.QueryEscape(key) + "=" + url.QueryEscape(value)
+	if query == "" {
+		return p
+	}
+	return query + "&" + p
+}
+
+// StripCORS removes every Access-Control-* header: no browser page may read a proxied answer.
+func StripCORS(h http.Header) {
+	for k := range h {
+		if len(k) >= 15 && strings.EqualFold(k[:15], "Access-Control-") {
+			delete(h, k)
+		}
+	}
 }

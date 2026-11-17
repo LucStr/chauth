@@ -8,16 +8,19 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/LucStr/chauth/internal/chapi"
 	"github.com/LucStr/chauth/internal/chwire"
+	"github.com/LucStr/chauth/internal/connect"
 )
 
 // ServeHTTP serves ClickHouse HTTP clients on ln until ctx ends; open requests then get 5 s.
 func (c *Connector) ServeHTTP(ctx context.Context, ln net.Listener, env string) error {
-	srv := &http.Server{Handler: c.HTTPHandler(env), ReadHeaderTimeout: handshakeTimeout}
+	srv := &http.Server{Handler: c.HTTPHandler(env), ReadHeaderTimeout: handshakeTimeout, IdleTimeout: chapi.IdleTimeout}
 	go func() {
 		<-ctx.Done()
 		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -35,7 +38,9 @@ func (c *Connector) ServeHTTP(ctx context.Context, ln net.Listener, env string) 
 type forward struct {
 	env   *Env
 	token string
-	// database is the target without the environment; header says whether it came as X-ClickHouse-Database.
+	// query is the client's raw query without credentials and database; database is the target
+	// without the environment, sent as X-ClickHouse-Database when header is set.
+	query    string
 	database string
 	header   bool
 }
@@ -43,7 +48,8 @@ type forward struct {
 type forwardKey struct{}
 
 // HTTPHandler forwards every path to the environment the request's database names, with the
-// environment's token as Bearer and every client credential removed.
+// environment's token as Bearer and every client credential removed. It serves programs, not web
+// pages: a request from a browser page or for a host name other than loopback is refused.
 func (c *Connector) HTTPHandler(env string) http.Handler {
 	proxy := &httputil.ReverseProxy{
 		FlushInterval: -1,
@@ -55,6 +61,10 @@ func (c *Connector) HTTPHandler(env string) http.Handler {
 			rewrite(pr.Out, f)
 			chapi.NoReplay(pr.Out)
 		},
+		ModifyResponse: func(resp *http.Response) error {
+			chapi.StripCORS(resp.Header)
+			return nil
+		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			f := r.Context().Value(forwardKey{}).(*forward)
 			c.log.Error("forward to chauth", "server", f.env.HTTPServer.Host, "error", err)
@@ -62,7 +72,12 @@ func (c *Connector) HTTPHandler(env string) http.Handler {
 		},
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		target, header, err := requestTarget(r)
+		if reason := fromBrowser(r); reason != "" {
+			c.log.Warn("request refused", "protocol", "http", "reason", reason)
+			httpError(w, http.StatusForbidden, chwire.CodeAccessDenied, "chauth connect: "+reason+"; the local port serves ClickHouse clients, not web pages")
+			return
+		}
+		query, target, header, err := requestTarget(r)
 		if err != nil {
 			httpError(w, http.StatusBadRequest, chwire.CodeUnknownDatabase, "chauth connect: "+err.Error())
 			return
@@ -73,58 +88,118 @@ func (c *Connector) HTTPHandler(env string) http.Handler {
 			httpError(w, http.StatusBadRequest, chwire.CodeUnknownDatabase, "chauth connect: "+err.Error())
 			return
 		}
-		tok, err := e.Tokens.Token(r.Context())
+		tok, err := tokenWithoutLogin(r.Context(), e)
 		if err != nil {
 			c.log.Error("no token", "env", e.Name, "error", err)
 			httpError(w, http.StatusUnauthorized, chwire.CodeAccessDenied, err.Error())
 			return
 		}
 		c.log.Info("request", "protocol", "http", "database", target+" → "+e.Name+":"+rest)
-		f := &forward{env: e, token: tok, database: rest, header: header}
+		f := &forward{env: e, token: tok, query: query, database: rest, header: header}
 		proxy.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), forwardKey{}, f)))
 	})
 }
 
-// requestTarget is the database the client named: the database parameter or the X-ClickHouse-Database
-// header, "" when neither is set; naming it twice is refused.
-func requestTarget(r *http.Request) (string, bool, error) {
-	params := r.URL.Query()["database"]
-	headers := r.Header.Values("X-ClickHouse-Database")
-	switch {
-	case len(params)+len(headers) > 1:
-		return "", false, errors.New("name the database once, as database= or X-ClickHouse-Database")
-	case len(headers) == 1:
-		return headers[0], true, nil
-	case len(params) == 1:
-		return params[0], false, nil
+// tokenWithoutLogin never opens a browser: an HTTP request may come from anything that reaches the
+// port, so a missing login is reported instead.
+func tokenWithoutLogin(ctx context.Context, e *Env) (string, error) {
+	src, ok := e.Tokens.(interface {
+		TokenWithoutLogin(context.Context) (string, error)
+	})
+	if !ok {
+		return e.Tokens.Token(ctx)
 	}
-	return "", false, nil
+	tok, err := src.TokenWithoutLogin(ctx)
+	if errors.Is(err, connect.ErrLoginRequired) {
+		return "", fmt.Errorf("chauth connect: not logged in to %s; run chauth login %s", e.Name, e.Name)
+	}
+	return tok, err
 }
 
-// credentialParams are URL parameters that would log in as someone else; ClickHouse matches them
-// case-sensitively, but any letter case is removed.
-var credentialParams = []string{"user", "password"}
-
-func rewrite(out *http.Request, f *forward) {
-	for _, h := range []string{"Authorization", "X-ClickHouse-User", "X-ClickHouse-Key", "X-ClickHouse-Database"} {
-		out.Header.Del(h)
+// fromBrowser is why r looks like it was sent by a web page, "" when it does not. A browser sends
+// Origin or Sec-Fetch-Site; a host name other than a loopback literal is DNS rebinding.
+func fromBrowser(r *http.Request) string {
+	if _, ok := r.Header["Origin"]; ok {
+		return "request has an Origin header"
 	}
-	q := out.URL.Query()
-	for k := range q {
-		for _, p := range append(credentialParams, "database") {
-			if strings.EqualFold(k, p) {
-				q.Del(k)
-			}
+	if v, ok := r.Header["Sec-Fetch-Site"]; ok && (len(v) != 1 || v[0] != "none") {
+		return "request comes from a web page"
+	}
+	local, _ := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
+	if local == nil || !loopbackHost(r.Host, local) {
+		return fmt.Sprintf("host %q is not this listener's loopback address", r.Host)
+	}
+	return ""
+}
+
+// loopbackHost reports whether host is localhost or a loopback IP literal with local's port; the
+// port may be left out only when it is 80.
+func loopbackHost(host string, local net.Addr) bool {
+	tcp, ok := local.(*net.TCPAddr)
+	if !ok {
+		return false
+	}
+	name, port, err := net.SplitHostPort(host)
+	if err != nil {
+		name, port = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]"), "80"
+		if strings.Contains(name, ":") && !strings.HasPrefix(host, "[") {
+			return false
 		}
 	}
+	if port != strconv.Itoa(tcp.Port) {
+		return false
+	}
+	if strings.EqualFold(name, "localhost") {
+		return true
+	}
+	ip, err := netip.ParseAddr(name)
+	return err == nil && ip.Zone() == "" && ip.IsLoopback()
+}
+
+// requestTarget removes the credential, CORS and database parameters from the raw query, keeping
+// the rest as sent, and returns the database the client named: parameter or header, "" when neither.
+func requestTarget(r *http.Request) (query, target string, header bool, err error) {
+	query, params, err := chapi.FilterQuery(r.URL.RawQuery, "database", func(k string) bool { return chapi.OneOf(k, droppedParams...) })
+	if err != nil {
+		return "", "", false, err
+	}
+	headers := r.Header.Values("X-ClickHouse-Database")
+	switch {
+	case len(params) > 1 || len(headers) > 1:
+		return "", "", false, errors.New("name the database once, as database= or X-ClickHouse-Database")
+	case len(params) == 1 && len(headers) == 1 && params[0] != headers[0]:
+		return "", "", false, errors.New("the database parameter and the X-ClickHouse-Database header disagree")
+	case len(params) == 1:
+		return query, params[0], false, nil
+	case len(headers) == 1:
+		return query, headers[0], true, nil
+	}
+	return query, "", false, nil
+}
+
+// droppedParams would log in as someone else or make the answer readable by a web page; ClickHouse
+// matches them case-sensitively, but any letter case is removed.
+var droppedParams = []string{"user", "password", chapi.CORSParam}
+
+// droppedHeaders are client credentials and what a browser adds; none of it is meant for serve.
+var droppedHeaders = []string{"Authorization", "X-ClickHouse-User", "X-ClickHouse-Key", "X-ClickHouse-Database",
+	"Origin", "Referer", "Cookie"}
+
+func rewrite(out *http.Request, f *forward) {
+	for k := range out.Header {
+		if chapi.OneOf(k, droppedHeaders...) || len(k) >= 10 && strings.EqualFold(k[:10], "Sec-Fetch-") {
+			delete(out.Header, k)
+		}
+	}
+	query := f.query
 	if f.database != "" {
 		if f.header {
 			out.Header.Set("X-ClickHouse-Database", f.database)
 		} else {
-			q.Set("database", f.database)
+			query = chapi.AppendParam(query, "database", f.database)
 		}
 	}
-	out.URL.RawQuery = q.Encode()
+	out.URL.RawQuery = query
 	out.Header.Set("Authorization", "Bearer "+f.token)
 }
 
