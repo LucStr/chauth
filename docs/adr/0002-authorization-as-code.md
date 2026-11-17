@@ -1,0 +1,5 @@
+# Access is decided from role-binding files, and the last valid set wins
+
+chauth decides read, write or nothing per database, and which named upstream roles a holder gets, from `ChRole` / `ChRoleBinding` YAML shaped like Kubernetes RBAC, matched against the token's user and groups and capped by its scope. The token only proves identity; it lists no grants. Access then lives in reviewed files next to the deployment instead of a second store.
+
+Validation is `chauth lint` in CI plus last-valid-wins at runtime, not an admission webhook: serve rereads the directory, waits until two reads agree, and a set that fails to parse or compile never replaces the live one. A file with no objects is rejected for the same reason, since a file caught mid-write reads as empty. A bad push therefore cannot lock everyone out, and no webhook has to stay up. The same YAML can later be watched as CRDs without a rewrite.
