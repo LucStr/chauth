@@ -21,9 +21,11 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/LucStr/chauth/internal/chapi"
 	"github.com/LucStr/chauth/internal/chwire"
 	"github.com/LucStr/chauth/internal/connect"
 )
@@ -184,11 +186,11 @@ func TestNative(t *testing.T) {
 		{"jwt marker passes through", unbound, chwire.UserJWT, "prod/", chwire.UserJWT, "", 0, ""},
 		{"bound port, no database", bound, "", "", "default", "", 0, ""},
 		{"bound port, bare database", bound, "", "core", "default", "core", 0, ""},
-		{"unbound port, bare database", unbound, "", "core", "", "", CodeUnknownDatabase, "chauth connect: use <env>/<db>; environments: down, prod, test"},
-		{"interserver marker", unbound, chwire.UserInterserverSecret, "prod/core", "", "", CodeAccessDenied, "chauth connect: this login method is not accepted; the token is the password"},
-		{"ssh marker", bound, chwire.UserSSHKey, "core", "", "", CodeAccessDenied, "chauth connect: this login method is not accepted; the token is the password"},
-		{"token file expires within 10 s", unbound, "", "test/core", "", "", CodeAccessDenied, "connect your account in Settings"},
-		{"server down", unbound, "", "down/core", "", "", CodeNetworkError, "chauth connect: cannot reach " + deadAddr},
+		{"unbound port, bare database", unbound, "", "core", "", "", chwire.CodeUnknownDatabase, "chauth connect: use <env>/<db>; environments: down, prod, test"},
+		{"interserver marker", unbound, chwire.UserInterserverSecret, "prod/core", "", "", chwire.CodeAccessDenied, "chauth connect: this login method is not accepted; the token is the password"},
+		{"ssh marker", bound, chwire.UserSSHKey, "core", "", "", chwire.CodeAccessDenied, "chauth connect: this login method is not accepted; the token is the password"},
+		{"token file expires within 10 s", unbound, "", "test/core", "", "", chwire.CodeAccessDenied, "connect your account in Settings"},
+		{"server down", unbound, "", "down/core", "", "", chwire.CodeNetworkError, "chauth connect: cannot reach " + deadAddr},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -349,8 +351,8 @@ func TestPrintAccess(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/.well-known/chauth":
-			_ = json.NewEncoder(w).Encode(Discovery{
-				Instances:  []Instance{{Name: "main", Databases: []string{"core", "otel", "audit"}}, {Name: "bidder", Databases: []string{"bids", "audit"}}},
+			_ = json.NewEncoder(w).Encode(chapi.Discovery{
+				Instances:  []chapi.Instance{{Name: "main", Databases: []string{"core", "otel", "audit"}}, {Name: "events", Databases: []string{"clicks", "audit"}}},
 				AccessHelp: "Ask in #data\nfor access.",
 			})
 		case "/v1/access":
@@ -358,10 +360,10 @@ func TestPrintAccess(t *testing.T) {
 				_, _ = io.WriteString(w, "[]")
 				return
 			}
-			_ = json.NewEncoder(w).Encode([]Access{
-				{Instance: "main", Database: "core", Level: "write"},
-				{Instance: "main", Database: "audit", Level: "read"},
-				{Instance: "main", Role: "chauth_querylog_read", Level: "read"},
+			_ = json.NewEncoder(w).Encode([]chapi.Access{
+				{Instance: "main", Level: "write", Roles: []string{"chauth_querylog_read"},
+					Databases: []chapi.DatabaseAccess{{Database: "core", Level: "write"}, {Database: "audit", Level: "read"}}},
+				{Instance: "events", Level: "read", Roles: []string{}, Databases: []chapi.DatabaseAccess{{Database: "clicks", Level: "read"}}},
 			})
 		}
 	}))
@@ -374,11 +376,12 @@ func TestPrintAccess(t *testing.T) {
 	}, quiet)
 	var out, errOut bytes.Buffer
 	err := c.PrintAccess(context.Background(), &out, &errOut, c.Names())
-	want := `DATABASE                        LEVEL
-prod/core                       write
-prod/main/audit                 read
-ROLE                            LEVEL
-prod/main chauth_querylog_read  read
+	want := `DATABASE         LEVEL
+prod/core        write
+prod/main/audit  read
+prod/clicks      read
+INSTANCE         ROLE
+prod/main        chauth_querylog_read
 stage: nothing is reachable with this token. Ask in #data for access.
 `
 	wantErr := "test: token file " + missing.Path + " missing or expired\n"
@@ -409,7 +412,7 @@ func TestClickHouseClient(t *testing.T) {
 			}
 			br := bufio.NewReader(conn)
 			if h, err := chwire.ReadHello(br, chwire.DefaultMaxHello); err == nil {
-				_ = chwire.WriteException(conn, 81, "UNKNOWN_DATABASE", "serve saw database "+h.Database+" as "+h.User)
+				_ = chwire.WriteException(conn, chwire.CodeUnknownDatabase, "serve saw database "+h.Database+" as "+h.User)
 			}
 			conn.Close()
 		}
@@ -434,5 +437,38 @@ func TestClickHouseClient(t *testing.T) {
 		if !errors.As(err, &exit) || !strings.Contains(string(out), tt.want) {
 			t.Errorf("%s: err %v, output:\n%s", tt.database, err, out)
 		}
+	}
+}
+
+// TestHTTPNoReplay: chauth serve closes a reused connection after reading the second GET; the
+// connector must answer 502 instead of sending the GET again.
+func TestHTTPNoReplay(t *testing.T) {
+	var seen atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if seen.Add(1) == 2 {
+			conn, _, _ := http.NewResponseController(w).Hijack()
+			conn.Close()
+			return
+		}
+		_, _ = io.WriteString(w, "1\n")
+	}))
+	defer srv.Close()
+	c := New([]*Env{testEnv("prod", "", srv, staticToken("tok"))}, quiet)
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = c.ServeHTTP(ctx, ln, "prod") }()
+	var statuses []int
+	for range 2 {
+		resp, err := http.Get("http://" + ln.Addr().String() + "/?query=SELECT+1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		statuses = append(statuses, resp.StatusCode)
+	}
+	if seen.Load() != 2 || statuses[0] != 200 || statuses[1] != http.StatusBadGateway {
+		t.Fatalf("server saw %d requests, statuses %v; want 2 and [200 502]", seen.Load(), statuses)
 	}
 }

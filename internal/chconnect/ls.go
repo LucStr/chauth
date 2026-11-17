@@ -11,61 +11,31 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+
+	"github.com/LucStr/chauth/internal/chapi"
 )
-
-// Discovery is the body of serve's GET /.well-known/chauth.
-type Discovery struct {
-	Native      string     `json:"native"`
-	HTTP        string     `json:"http"`
-	Issuer      string     `json:"issuer"`
-	Audience    string     `json:"audience"`
-	CLIClientID string     `json:"cli_client_id"`
-	Scopes      Scopes     `json:"scopes"`
-	Instances   []Instance `json:"instances"`
-	AccessHelp  string     `json:"access_help,omitempty"`
-}
-
-type Scopes struct {
-	Read  string `json:"read"`
-	Write string `json:"write"`
-}
-
-type Instance struct {
-	Name      string   `json:"name"`
-	Databases []string `json:"databases"`
-	Roles     []string `json:"roles,omitempty"`
-}
-
-// Access is one entry of GET /v1/access: a database or a named upstream role the token reaches,
-// with its level after the scope cap.
-type Access struct {
-	Instance string `json:"instance"`
-	Database string `json:"database,omitempty"`
-	Role     string `json:"role,omitempty"`
-	Level    string `json:"level"`
-}
 
 func (e *Env) api(path string) string { return e.HTTPServer.String() + path }
 
 // Discovery fetches serve's public discovery.
-func (e *Env) Discovery(ctx context.Context) (*Discovery, error) {
-	var d Discovery
-	return &d, getJSON(ctx, e.HTTP, e.api("/.well-known/chauth"), "", &d)
+func (e *Env) Discovery(ctx context.Context) (*chapi.Discovery, error) {
+	var d chapi.Discovery
+	return &d, getJSON(ctx, e.HTTP, e.api(chapi.DiscoveryPath), "", &d)
 }
 
 // Access lists what this environment's token reaches.
-func (e *Env) Access(ctx context.Context) ([]Access, error) {
+func (e *Env) Access(ctx context.Context) ([]chapi.Access, error) {
 	tok, err := e.Tokens.Token(ctx)
 	if err != nil {
 		return nil, err
 	}
-	var out []Access
-	return out, getJSON(ctx, e.HTTP, e.api("/v1/access"), tok, &out)
+	var out []chapi.Access
+	return out, getJSON(ctx, e.HTTP, e.api(chapi.AccessPath), tok, &out)
 }
 
 // Address is the shortest name that reaches instance/db: "<env>/<db>" when no other instance has a
 // database of that name, else "<env>/<instance>/<db>"; without discovery always the long form.
-func (e *Env) Address(d *Discovery, instance, db string) string {
+func (e *Env) Address(d *chapi.Discovery, instance, db string) string {
 	if d != nil {
 		n := 0
 		for _, in := range d.Instances {
@@ -80,14 +50,13 @@ func (e *Env) Address(d *Discovery, instance, db string) string {
 	return e.Name + "/" + instance + "/" + db
 }
 
-// PrintAccess writes what each named environment's token reaches to out and per-environment
-// failures to errOut; an environment with nothing reachable gets the server's access help.
+// PrintAccess writes what each named environment's token reaches to out, databases first, then named
+// roles, and per-environment failures to errOut; an environment with nothing reachable gets the
+// server's access help.
 func (c *Connector) PrintAccess(ctx context.Context, out, errOut io.Writer, names []string) error {
-	type role struct{ name, level string }
 	w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(w, "DATABASE\tLEVEL")
-	var roles []role
-	var empty []string
+	var roles, empty []string
 	failed := false
 	for _, name := range names {
 		e := c.envs[name]
@@ -102,11 +71,12 @@ func (c *Connector) PrintAccess(ctx context.Context, out, errOut io.Writer, name
 			d = nil
 		}
 		for _, a := range access {
-			if a.Role != "" {
-				roles = append(roles, role{e.Name + "/" + a.Instance + " " + a.Role, a.Level})
-				continue
+			for _, db := range a.Databases {
+				fmt.Fprintf(w, "%s\t%s\n", e.Address(d, a.Instance, db.Database), db.Level)
 			}
-			fmt.Fprintf(w, "%s\t%s\n", e.Address(d, a.Instance, a.Database), a.Level)
+			for _, r := range a.Roles {
+				roles = append(roles, e.Name+"/"+a.Instance+"\t"+r)
+			}
 		}
 		if len(access) == 0 {
 			msg := name + ": nothing is reachable with this token."
@@ -117,9 +87,9 @@ func (c *Connector) PrintAccess(ctx context.Context, out, errOut io.Writer, name
 		}
 	}
 	if len(roles) > 0 {
-		fmt.Fprintln(w, "ROLE\tLEVEL")
+		fmt.Fprintln(w, "INSTANCE\tROLE")
 		for _, r := range roles {
-			fmt.Fprintf(w, "%s\t%s\n", r.name, r.level)
+			fmt.Fprintln(w, r)
 		}
 	}
 	_ = w.Flush()
@@ -148,9 +118,7 @@ func getJSON(ctx context.Context, client *http.Client, url, bearer string, v any
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		var e struct {
-			Error string `json:"error"`
-		}
+		var e chapi.Error
 		_ = json.NewDecoder(resp.Body).Decode(&e)
 		if e.Error == "" {
 			e.Error = resp.Status

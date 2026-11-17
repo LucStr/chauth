@@ -31,6 +31,32 @@ func RefusedUser(user string) bool {
 	return user == UserInterserverSecret || user == UserSSHKey
 }
 
+// Exception codes chauth sends on both sides, always named ExceptionName: another name makes
+// clickhouse-client print it twice. Never 516: on it the interactive client prompts for a password.
+const (
+	CodeUnknownDatabase  = 81
+	CodeUnexpectedPacket = 101
+	CodeTooManyQueries   = 202
+	CodeNetworkError     = 210
+	CodeAccessDenied     = 497
+	// CodeAuthenticationFailed is what ClickHouse answers for a wrong password, unknown user or host.
+	CodeAuthenticationFailed = 516
+)
+
+const ExceptionName = "DB::Exception"
+
+var codeNames = map[int32]string{
+	CodeUnknownDatabase:      "UNKNOWN_DATABASE",
+	CodeUnexpectedPacket:     "UNEXPECTED_PACKET_FROM_CLIENT",
+	CodeTooManyQueries:       "TOO_MANY_SIMULTANEOUS_QUERIES",
+	CodeNetworkError:         "NETWORK_ERROR",
+	CodeAccessDenied:         "ACCESS_DENIED",
+	CodeAuthenticationFailed: "AUTHENTICATION_FAILED",
+}
+
+// CodeName is ClickHouse's name of code, as shown in parentheses after a message.
+func CodeName(code int32) string { return codeNames[code] }
+
 // DefaultMaxHello caps the bytes a client may send before it is authenticated.
 const DefaultMaxHello = 64 << 10
 
@@ -97,12 +123,12 @@ type Exception struct {
 
 func (e *Exception) Error() string { return fmt.Sprintf("code %d: %s", e.Code, e.Message) }
 
-// WriteException sends one Exception packet without a stack trace or nested exception.
-func WriteException(w io.Writer, code int32, name, message string) error {
+// WriteException sends one Exception packet named ExceptionName, without a stack trace or nested exception.
+func WriteException(w io.Writer, code int32, message string) error {
 	var b []byte
 	b = binary.AppendUvarint(b, ServerException)
 	b = binary.LittleEndian.AppendUint32(b, uint32(code))
-	b = appendString(b, name)
+	b = appendString(b, ExceptionName)
 	b = appendString(b, message)
 	b = appendString(b, "")
 	b = append(b, 0)

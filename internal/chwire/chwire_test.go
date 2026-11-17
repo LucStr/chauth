@@ -55,7 +55,7 @@ func TestHello(t *testing.T) {
 
 func TestException(t *testing.T) {
 	var written bytes.Buffer
-	if err := WriteException(&written, 516, "DB::Exception", "token rejected"); err != nil {
+	if err := WriteException(&written, CodeAccessDenied, "token rejected"); err != nil {
 		t.Fatal(err)
 	}
 	nested := []byte{ServerException}
@@ -77,7 +77,7 @@ func TestException(t *testing.T) {
 		inner string
 		err   string
 	}{
-		{"written exception decodes", written.Bytes(), ServerException, 516, "token rejected", "", ""},
+		{"written exception decodes", written.Bytes(), ServerException, CodeAccessDenied, "token rejected", "", ""},
 		{"nested chain", nested, ServerException, 81, "outer", "inner", ""},
 		{"truncated", written.Bytes()[:6], ServerException, 0, "", "", "unexpected EOF"},
 		{"server hello is not an exception", []byte{ServerHello, 3, 'a', 'b', 'c'}, ServerHello, 0, "", "", "is not an Exception"},
@@ -98,7 +98,7 @@ func TestException(t *testing.T) {
 				}
 				return
 			}
-			if err != nil || e.Code != tt.code || e.Message != tt.msg {
+			if err != nil || e.Code != tt.code || e.Message != tt.msg || e.Name != ExceptionName {
 				t.Fatalf("exception %+v, err %v", e, err)
 			}
 			if inner := ""; e.Nested != nil {

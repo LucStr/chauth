@@ -4,13 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"strings"
 	"time"
+
+	"github.com/LucStr/chauth/internal/chapi"
+	"github.com/LucStr/chauth/internal/chwire"
 )
 
 // ServeHTTP serves ClickHouse HTTP clients on ln until ctx ends; open requests then get 5 s.
@@ -51,33 +53,30 @@ func (c *Connector) HTTPHandler(env string) http.Handler {
 			f := pr.In.Context().Value(forwardKey{}).(*forward)
 			pr.SetURL(f.env.HTTPServer)
 			rewrite(pr.Out, f)
-			// A non-nil body without GetBody keeps the transport from replaying the request.
-			if pr.Out.Body == nil {
-				pr.Out.Body = io.NopCloser(strings.NewReader(""))
-			}
+			chapi.NoReplay(pr.Out)
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			f := r.Context().Value(forwardKey{}).(*forward)
 			c.log.Error("forward to chauth", "server", f.env.HTTPServer.Host, "error", err)
-			httpError(w, http.StatusBadGateway, CodeNetworkError, "chauth connect: cannot reach "+f.env.HTTPServer.Host)
+			httpError(w, http.StatusBadGateway, chwire.CodeNetworkError, "chauth connect: cannot reach "+f.env.HTTPServer.Host)
 		},
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		target, header, err := requestTarget(r)
 		if err != nil {
-			httpError(w, http.StatusBadRequest, CodeUnknownDatabase, "chauth connect: "+err.Error())
+			httpError(w, http.StatusBadRequest, chwire.CodeUnknownDatabase, "chauth connect: "+err.Error())
 			return
 		}
 		e, rest, err := c.route(target, env)
 		if err != nil {
 			c.log.Info("request refused", "protocol", "http", "database", target, "reason", err)
-			httpError(w, http.StatusBadRequest, CodeUnknownDatabase, "chauth connect: "+err.Error())
+			httpError(w, http.StatusBadRequest, chwire.CodeUnknownDatabase, "chauth connect: "+err.Error())
 			return
 		}
 		tok, err := e.Tokens.Token(r.Context())
 		if err != nil {
 			c.log.Error("no token", "env", e.Name, "error", err)
-			httpError(w, http.StatusUnauthorized, CodeAccessDenied, err.Error())
+			httpError(w, http.StatusUnauthorized, chwire.CodeAccessDenied, err.Error())
 			return
 		}
 		c.log.Info("request", "protocol", "http", "database", target+" → "+e.Name+":"+rest)
@@ -142,5 +141,5 @@ func httpError(w http.ResponseWriter, status int, code int32, msg string) {
 	w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
 	w.Header().Set("X-ClickHouse-Exception-Code", fmt.Sprint(code))
 	w.WriteHeader(status)
-	fmt.Fprintf(w, "Code: %d. DB::Exception: %s. (%s)\n", code, msg, codeNames[code])
+	fmt.Fprintf(w, "Code: %d. %s: %s. (%s)\n", code, chwire.ExceptionName, msg, chwire.CodeName(code))
 }

@@ -13,22 +13,6 @@ import (
 	"github.com/LucStr/chauth/internal/chwire"
 )
 
-// Exception codes the connector itself sends, named DB::Exception as a server would. Never 516: on
-// it the interactive client asks for a password and waits.
-const (
-	CodeAccessDenied     = 497
-	CodeUnknownDatabase  = 81
-	CodeNetworkError     = 210
-	CodeUnexpectedPacket = 101
-)
-
-var codeNames = map[int32]string{
-	CodeAccessDenied:     "ACCESS_DENIED",
-	CodeUnknownDatabase:  "UNKNOWN_DATABASE",
-	CodeNetworkError:     "NETWORK_ERROR",
-	CodeUnexpectedPacket: "UNEXPECTED_PACKET_FROM_CLIENT",
-}
-
 // ServeNative accepts native ClickHouse connections on ln until ctx ends, then waits for the open ones.
 func (c *Connector) ServeNative(ctx context.Context, ln net.Listener, env string) error {
 	go func() {
@@ -56,19 +40,19 @@ func (c *Connector) handleNative(ctx context.Context, conn net.Conn, env string)
 	hello, err := chwire.ReadHello(br, maxHello)
 	if err != nil {
 		if errors.Is(err, chwire.ErrNotHello) || errors.Is(err, chwire.ErrTooLarge) {
-			c.refuse(conn, CodeUnexpectedPacket, "chauth connect: "+err.Error())
+			c.refuse(conn, chwire.CodeUnexpectedPacket, "chauth connect: "+err.Error())
 		}
 		return
 	}
 	if chwire.RefusedUser(hello.User) {
 		c.log.Info("connection refused", "protocol", "native", "reason", "user marker")
-		c.refuse(conn, CodeAccessDenied, "chauth connect: this login method is not accepted; the token is the password")
+		c.refuse(conn, chwire.CodeAccessDenied, "chauth connect: this login method is not accepted; the token is the password")
 		return
 	}
 	e, rest, err := c.route(hello.Database, env)
 	if err != nil {
 		c.log.Info("connection refused", "protocol", "native", "database", hello.Database, "reason", err)
-		c.refuse(conn, CodeUnknownDatabase, "chauth connect: "+err.Error())
+		c.refuse(conn, chwire.CodeUnknownDatabase, "chauth connect: "+err.Error())
 		return
 	}
 	c.log.Info("connection", "protocol", "native", "database", hello.Database+" → "+e.Name+":"+rest)
@@ -76,13 +60,13 @@ func (c *Connector) handleNative(ctx context.Context, conn net.Conn, env string)
 	tok, err := e.Tokens.Token(ctx)
 	if err != nil {
 		c.log.Error("no token", "env", e.Name, "error", err)
-		c.refuse(conn, CodeAccessDenied, err.Error())
+		c.refuse(conn, chwire.CodeAccessDenied, err.Error())
 		return
 	}
 	up, err := dialNative(ctx, e)
 	if err != nil {
 		c.log.Error("dial chauth", "server", e.Server, "error", err)
-		c.refuse(conn, CodeNetworkError, "chauth connect: cannot reach "+e.Server)
+		c.refuse(conn, chwire.CodeNetworkError, "chauth connect: cannot reach "+e.Server)
 		return
 	}
 	defer up.Close()
@@ -92,7 +76,7 @@ func (c *Connector) handleNative(ctx context.Context, conn net.Conn, env string)
 		hello.User = "default"
 	}
 	if _, err := hello.WriteTo(up); err != nil {
-		c.refuse(conn, CodeNetworkError, "chauth connect: "+e.Server+" closed the connection")
+		c.refuse(conn, chwire.CodeNetworkError, "chauth connect: "+e.Server+" closed the connection")
 		return
 	}
 	splice(conn, br, up)
@@ -101,7 +85,7 @@ func (c *Connector) handleNative(ctx context.Context, conn net.Conn, env string)
 // refuse sends one Exception, half-closes and drains, so the client reads the message instead of a reset.
 func (c *Connector) refuse(conn net.Conn, code int32, msg string) {
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
-	if chwire.WriteException(conn, code, "DB::Exception", msg) != nil {
+	if chwire.WriteException(conn, code, msg) != nil {
 		return
 	}
 	if tc, ok := conn.(*net.TCPConn); ok {
