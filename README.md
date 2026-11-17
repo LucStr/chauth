@@ -170,6 +170,10 @@ spec:
   subjects: [{kind: Group, name: viewers}]
 ```
 
+A rules directory that is missing, unreadable or holds no `*.yaml` rule file is refused like an
+invalid set: serve is not ready at startup and keeps the last valid set at reload. To deny everyone,
+keep `ChRole`s without bindings.
+
 Every configured database also has built-in roles `<instance>.<db>.read` and `<instance>.<db>.write`.
 The level a binding gives is capped by the token's scope. Details, the serve config and the connect
 config: [`docs/config.md`](docs/config.md).

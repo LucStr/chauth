@@ -30,6 +30,7 @@ func TestLint(t *testing.T) {
 		{"read-only database is not checked without config", []string{role("{instance: main, database: system, level: write}")}, 0},
 		{"a foreign kind", []string{writeDir("apiVersion: chauth.dev/v1alpha1\nkind: ClusterRole\nmetadata: {name: x}\nspec: {}\n")}, 1},
 		{"missing directory", []string{"../../examples/missing"}, 1},
+		{"directory without rule files", []string{t.TempDir()}, 1},
 	}
 	for _, tt := range tests {
 		if got := lint(tt.args); got != tt.want {

@@ -81,8 +81,10 @@ mistake and `chauth lint --config` rejects it; serve caps it to read.
 `chauth lint [--config config.yaml] <dir>` checks the rules offline. Without `--config` it checks
 each object and the references between them; with it, also instances, databases, the roles
 allowlist and read-only databases. Every `*.yaml` directly in `<dir>` is read except
-`kustomization.yaml`. A file with no object is an error (delete it instead of emptying it), and
-serve keeps the last valid set when a change is rejected ([ADR 0002](adr/0002-authorization-as-code.md)).
+`kustomization.yaml`. A file with no object is an error (delete it instead of emptying it), and so is a
+directory that is missing, unreadable or holds no rule file; to deny everyone, keep `ChRole`s
+without bindings. serve is not ready until a valid set loads, and keeps the last valid set when a
+change is rejected ([ADR 0002](adr/0002-authorization-as-code.md)).
 See [`examples/rbac`](../examples/rbac).
 
 ## Addresses

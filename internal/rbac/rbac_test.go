@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -319,6 +320,82 @@ spec: {roleRef: {kind: ChRole, name: other.core.write}, subjects: [{kind: User, 
 		g := policy.Grants(tt.who, tt.instance, tt.cap)
 		if !reflect.DeepEqual(g.Databases, tt.dbs) || !slices.Equal(g.Roles, tt.roles) || !slices.Equal(g.Bindings, tt.bindings) {
 			t.Errorf("row %d: got %+v, want %v %v %v", i, g, tt.dbs, tt.roles, tt.bindings)
+		}
+	}
+}
+
+// TestRulesDirGone: a missing, unreadable or emptied directory is a rejected load, at startup and
+// at reload; the last valid set stays live.
+func TestRulesDirGone(t *testing.T) {
+	valid := header + "kind: ChRoleBinding\nmetadata: {name: alice}\nspec:\n  roleRef: {kind: ChRole, name: main.core.read}\n" +
+		"  subjects: [{kind: User, name: alice@example.com}]\n"
+	tests := []struct {
+		name     string
+		breakDir func(dir string) error
+	}{
+		{"missing", os.RemoveAll},
+		{"unreadable", func(dir string) error { return os.Chmod(dir, 0) }},
+		{"no rule files", func(dir string) error {
+			if err := os.Remove(filepath.Join(dir, "rules.yaml")); err != nil {
+				return err
+			}
+			return os.WriteFile(filepath.Join(dir, "kustomization.yaml"), []byte("resources: []\n"), 0o600)
+		}},
+	}
+	for _, tt := range tests {
+		for _, phase := range []string{"startup", "reload"} {
+			t.Run(tt.name+" at "+phase, func(t *testing.T) {
+				dir := filepath.Join(t.TempDir(), "rbac")
+				if err := os.Mkdir(dir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+				if err := os.WriteFile(filepath.Join(dir, "rules.yaml"), []byte(valid), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				store := NewStore(instances, roles, slog.New(slog.NewTextHandler(io.Discard, nil)))
+				store.Settle = 0
+				var rejected atomic.Int32
+				store.OnLoad = func(err error) {
+					if err != nil {
+						rejected.Add(1)
+					}
+				}
+				if phase == "startup" {
+					if err := tt.breakDir(dir); err != nil {
+						t.Fatal(err)
+					}
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				go store.WatchDir(ctx, dir, 10*time.Millisecond)
+				if phase == "reload" {
+					waitUntil(t, func() bool { return store.Status().Loaded })
+					if err := tt.breakDir(dir); err != nil {
+						t.Fatal(err)
+					}
+				}
+				waitUntil(t, func() bool { return rejected.Load() > 0 && store.Status().Rejected != nil })
+				st := store.Status()
+				if phase == "startup" && (st.Loaded || store.Policy() != nil) {
+					t.Fatal("serve has rules from a directory that holds none")
+				}
+				if phase == "reload" && (!st.Loaded || store.Policy().Grants(Who{User: "alice@example.com"}, "main", Write).Databases["core"] != Read) {
+					t.Fatal("the last valid set was replaced")
+				}
+			})
+		}
+	}
+	if _, err := ReadDir(t.TempDir()); err == nil || !strings.Contains(err.Error(), "holds no *.yaml rule file") {
+		t.Errorf("ReadDir of an empty directory: %v", err)
+	}
+}
+
+func waitUntil(t *testing.T, ok func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); !ok(); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out")
 		}
 	}
 }

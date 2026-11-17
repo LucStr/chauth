@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -14,18 +15,25 @@ import (
 )
 
 // ReadDir returns every *.yaml file directly in dir, sorted by name, except kustomization.yaml so
-// the rules can live next to the kustomization that builds their ConfigMap.
+// the rules can live next to the kustomization that builds their ConfigMap. A directory that is
+// missing, unreadable or holds no rule file is an error: a lost mount must not read as "no access".
 func ReadDir(dir string) ([]File, error) {
-	paths, err := filepath.Glob(filepath.Join(dir, "*.yaml"))
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
+	}
+	var paths []string
+	for _, e := range entries {
+		if ok, _ := filepath.Match("*.yaml", e.Name()); ok && e.Name() != "kustomization.yaml" {
+			paths = append(paths, filepath.Join(dir, e.Name()))
+		}
+	}
+	if len(paths) == 0 {
+		return nil, fmt.Errorf("%s holds no *.yaml rule file; to deny everyone, keep the ChRoles without bindings", dir)
 	}
 	sort.Strings(paths)
 	files := make([]File, 0, len(paths))
 	for _, p := range paths {
-		if filepath.Base(p) == "kustomization.yaml" {
-			continue
-		}
 		b, err := os.ReadFile(p)
 		if err != nil {
 			return nil, err
@@ -158,7 +166,7 @@ func (s *Store) WatchDir(ctx context.Context, dir string, interval time.Duration
 			s.status.Rejected, s.status.RejectedAt = err, time.Now()
 			s.digest = [32]byte{}
 			s.mu.Unlock()
-			s.log.Error("access rules unreadable; keeping the last valid set", "error", err)
+			s.log.Error("access rules unreadable; keeping the last valid set", "loaded", s.Status().Loaded, "error", err)
 			if s.OnLoad != nil {
 				s.OnLoad(err)
 			}
