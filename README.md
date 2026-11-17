@@ -124,7 +124,8 @@ CREATE ROLE chauth_system_read;
 GRANT SELECT ON system.parts TO chauth_system_read;
 GRANT SELECT ON system.settings_changes TO chauth_system_read;
 
--- A role granted by name (instances[].roles).
+-- A role granted by name (instances[].roles), granted verbatim: REMOTE and CLUSTER reach beyond the
+-- per-database model (as would URL or FILE), so bind a role like this to administrators only.
 CREATE ROLE chauth_querylog_read;
 GRANT SELECT ON system.query_log TO chauth_querylog_read;
 GRANT CLUSTER ON *.* TO chauth_querylog_read;
@@ -198,8 +199,20 @@ config: [`docs/config.md`](docs/config.md).
   empty query. On shutdown serve stops accepting, gives running HTTP requests `shutdownGrace` (10 s),
   cuts the rest and drops its temp users within 10 s more; set the termination grace period above
   `shutdownGrace` + 10 s ([shutdown](docs/config.md#shutdown)).
-- The admin user can grant or revoke its roles on any existing ClickHouse user; keep its credentials
-  with chauth alone and limit it by `HOST IP`.
+- The admin user can grant or revoke the chauth roles (every role it holds `WITH ADMIN OPTION`) on
+  any existing ClickHouse user, not only on temp users; keep its credentials with chauth alone and
+  limit it by `HOST IP`.
+- The ClickHouse user name is the configured claim (`oidc.usernameClaim`, default `email`), and
+  `User` bindings match it. Use an issuer that only issues verified addresses in that claim, or bind
+  groups instead.
+- A temp user's name is not a secret: the client can run `SELECT currentUser()`, and ClickHouse
+  errors after login, which name it, are relayed as sent; only errors before login are replaced. Its
+  password never leaves chauth.
+- A named role (`instances[].roles`) is granted verbatim: a role holding `REMOTE`, `CLUSTER`, `URL`
+  or `FILE` reaches beyond the per-database model, so bind such roles to administrators only.
+- A view or dictionary created with `SQL SECURITY DEFINER` grants whatever its definer may do to
+  anyone who may read it, chauth's temp users included; review such objects in the served databases.
+- Anything running as the same OS user can use the connector's local ports and so your access.
 - The connector listens only on loopback addresses and never runs a configured command: tokens come
   from a browser login or a file ([ADR 0004](docs/adr/0004-tokens-from-login-or-file.md)).
 - The connector's HTTP port refuses web pages: a request with an `Origin` header, a `Sec-Fetch-Site`

@@ -25,7 +25,7 @@ chauth connect   # then: clickhouse-client -d prod/core, curl localhost:8123 --d
 | `oidc.issuer`, `oidc.audience` | required | token issuer and audience |
 | `oidc.allowedClients` | required, non-empty | clients whose tokens are accepted; startup fails when empty |
 | `oidc.usernameClaim` / `groupsClaim` / `clientIdClaim` | `email` / `groups` / `client_id` | claim names; the client id falls back to `azp` |
-| `oidc.usernameCaseInsensitive` | `true` | compare `User` subjects ignoring case |
+| `oidc.usernameCaseInsensitive` | `true` | compare `User` subjects ignoring case; privileged bindings are safer on groups than on individual names |
 | `oidc.groupsPrefix` | none | prepended to every group before bindings are matched |
 | `oidc.scopes.read` / `.write` | `clickhouse:read` / `clickhouse:write` | scope cap; a token with neither is refused |
 | `rbac.dir` | required | `ChRole` / `ChRoleBinding` YAML, reread every `rbac.reloadInterval` (`10s`, must be positive) |
@@ -68,6 +68,9 @@ spec:
     - {instance: main, database: "*", level: read}                # every database of main
     - {instance: main, role: chauth_querylog_read, level: read}   # must be in instances[].roles
 ```
+
+A named role is granted verbatim. A role holding `REMOTE`, `CLUSTER`, `URL` or `FILE` reaches beyond
+the per-database model (other servers, files, URLs), so bind such roles to administrators only.
 
 The temp user gets, for every database the holder reaches on the instance, the template role at
 `min(binding level, scope cap)`, plus each named role whose level the scope cap reaches. The target
@@ -139,7 +142,7 @@ because `clickhouse-client` answers it with a password prompt.
 
 | Code | Meaning | HTTP status |
 | --- | --- | --- |
-| 497 `ACCESS_DENIED` | token missing, refused or expired; no binding; no scope | 401, or 403 for a valid token |
+| 497 `ACCESS_DENIED` | token missing, refused or expired; no binding; no scope; a web page at the connector | 401, or 403 for a valid token or a web page |
 | 81 `UNKNOWN_DATABASE` | unknown environment, instance or database | 400 |
 | 210 `NETWORK_ERROR` | upstream or serve unreachable, temp user not created | 502 / 503 |
 | 202 `TOO_MANY_SIMULTANEOUS_QUERIES` | `maxConnectionsPerUser` reached | 429 |

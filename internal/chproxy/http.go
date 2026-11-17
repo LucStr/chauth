@@ -192,7 +192,7 @@ func queryIDOf(query string) string {
 	return ids[len(ids)-1]
 }
 
-// hideLoginFailure replaces an upstream authentication error, which names the temp user.
+// hideLoginFailure replaces an upstream authentication error, which a retry may fix, with a 502.
 func hideLoginFailure(resp *http.Response) error {
 	if resp.StatusCode < 400 || resp.Header.Get("X-ClickHouse-Exception-Code") != strconv.Itoa(chwire.CodeAuthenticationFailed) {
 		return nil

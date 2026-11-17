@@ -16,7 +16,8 @@ CREATE ROLE chauth_system_read;
 GRANT SELECT ON system.parts TO chauth_system_read;
 GRANT SELECT ON system.settings_changes TO chauth_system_read;
 
--- A role granted by name (instances[].roles).
+-- A role granted by name (instances[].roles), granted verbatim: REMOTE and CLUSTER reach beyond the
+-- per-database model (as would URL or FILE), so bind a role like this to administrators only.
 CREATE ROLE chauth_querylog_read;
 GRANT SELECT ON system.query_log TO chauth_querylog_read;
 GRANT CLUSTER ON *.* TO chauth_querylog_read;

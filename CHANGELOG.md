@@ -15,6 +15,11 @@ First release, v0.1.0:
 - `chauth connect`: local native and HTTP ports that route `<env>/<db>` to an environment and add
   its token from a browser login (PKCE, refresh token in the OS keychain, redirect
   `http://127.0.0.1:8250/callback`) or a token file; listeners bound to one environment.
+  The local HTTP port refuses web pages (`Origin`, `Sec-Fetch-Site`, non-loopback `Host`) and never
+  opens a browser login.
+- serve bounds unauthenticated connections (`maxPreAuthConnections`, `maxPreAuthConnectionsPerIP`,
+  `maxHTTPConnections`), cancels the upstream query of an HTTP request whose client left, and shuts
+  down within `shutdownGrace` + 10 s, dropping its temp users.
 - `chauth ls`, `login`, `logout`, `service install|uninstall`, `lint`, `version`.
 - `examples/clickhouse-setup.sql`: the upstream roles and admin login, run by the tests.
 - Image `ghcr.io/lucstr/chauth` and binaries for macOS and Linux (amd64, arm64).

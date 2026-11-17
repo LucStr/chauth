@@ -141,7 +141,7 @@ func (s *Server) handleNative(raw net.Conn, verified func()) {
 }
 
 // dialNative logs in upstream as lease and returns once the server Hello is next on the reader. An
-// upstream Exception is returned with its code and never relayed: it names the temp user.
+// upstream Exception is returned with its code and never relayed, so chauth words the refusal.
 func (s *Server) dialNative(ctx context.Context, in *instance, h chwire.Hello, lease *chusers.Lease, db string) (net.Conn, *bufio.Reader, int32, error) {
 	host, _, err := net.SplitHostPort(in.cfg.Native)
 	if err != nil {
