@@ -1048,21 +1048,26 @@ func TestMixedCaseDatabase(t *testing.T) {
 }
 
 // TestHTTPClientGone: a client that disconnects mid-query cancels the upstream query, also when a
-// compressed answer has written nothing yet, so ClickHouse cannot notice the closed connection.
+// compressed answer has written nothing yet, so ClickHouse cannot notice the closed connection, and
+// when the client names query_id twice or empty.
 func TestHTTPClientGone(t *testing.T) {
 	h := start(t, coreWrite, nil)
 	tests := []struct {
-		name, scope, encoding string
+		name, scope, encoding, params string
 	}{
-		{"read level, gzip", "clickhouse:read", "gzip"},
-		{"write level, gzip", "clickhouse:write", "gzip"},
-		{"write level, uncompressed", "clickhouse:write", "identity"},
+		{"read level, gzip", "clickhouse:read", "gzip", ""},
+		{"write level, gzip", "clickhouse:write", "gzip", ""},
+		{"write level, uncompressed", "clickhouse:write", "identity", ""},
+		{"query_id twice", "clickhouse:write", "gzip", "&query_id=first-" + rand.Text() + "&query_id=second-" + rand.Text()},
+		{"empty query_id first", "clickhouse:write", "gzip", "&query_id=&query_id=next-" + rand.Text()},
+		{"replace_running_query from the client", "clickhouse:write", "gzip", "&replace_running_query=0&query_id=own-" + rand.Text()},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			id := "gone-" + rand.Text()
+			marker := "gone-" + rand.Text()
 			ctx, cancel := context.WithCancel(context.Background())
-			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, h.url+"/?database=core&max_block_size=1&query_id="+id, strings.NewReader("SELECT sleepEachRow(1) FROM numbers(60)"))
+			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, h.url+"/?database=core&max_block_size=1"+tt.params,
+				strings.NewReader("SELECT sleepEachRow(1), '"+marker+"' FROM numbers(60)"))
 			req.Header.Set("Authorization", "Bearer "+shared.Issuer.Token(chtest.Claims{Scope: tt.scope}))
 			req.Header.Set("Accept-Encoding", tt.encoding)
 			go func() {
@@ -1071,11 +1076,34 @@ func TestHTTPClientGone(t *testing.T) {
 					resp.Body.Close()
 				}
 			}()
-			running := func() string { return mustRoot(t, "SELECT count() FROM system.processes WHERE query_id = '"+id+"'") }
+			running := func() string {
+				return mustRoot(t, "SELECT count() FROM system.processes WHERE user != 'default' AND query LIKE '%"+marker+"%'")
+			}
 			waitFor(t, "query running", func() bool { return running() == "1" })
 			cancel()
 			waitFor(t, "query cancelled", func() bool { return running() == "0" })
 		})
+	}
+}
+
+func TestOneQueryID(t *testing.T) {
+	tests := []struct{ in, out, id string }{
+		{"a=1", "a=1&query_id=", ""},
+		{"query_id=A&b=2&query_id=B", "b=2&query_id=A", "A"},
+		{"query_id=&Query_Id=B", "query_id=B", "B"},
+		{"replace_running_query=1&query_id=A&replace_running_query=0", "replace_running_query=1&query_id=A", "A"},
+	}
+	for _, tt := range tests {
+		out, id := oneQueryID(tt.in)
+		if tt.id == "" {
+			if !strings.HasPrefix(out, tt.out+"chauth-") || !strings.HasPrefix(id, "chauth-") {
+				t.Errorf("%q: %q %q, want a generated id", tt.in, out, id)
+			}
+			continue
+		}
+		if out != tt.out || id != tt.id {
+			t.Errorf("%q: %q %q, want %q %q", tt.in, out, id, tt.out, tt.id)
+		}
 	}
 }
 

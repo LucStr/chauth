@@ -124,11 +124,7 @@ func (s *Server) proxyHTTP(w http.ResponseWriter, r *http.Request) {
 	defer lease.Release()
 	a.tempUser = lease.User
 	query = chapi.AppendParam(query, "database", d.Database)
-	queryID := queryIDOf(query)
-	if queryID == "" {
-		queryID = "chauth-" + rand.Text()
-		query = chapi.AppendParam(query, "query_id", queryID)
-	}
+	query, queryID := oneQueryID(query)
 	completed := false
 	defer func() {
 		if completed {
@@ -190,13 +186,26 @@ func (s *Server) proxyHTTP(w http.ResponseWriter, r *http.Request) {
 	completed = r.Context().Err() == nil && upstreamErr == nil
 }
 
-// queryIDOf is the query_id parameter of a raw query, "" when there is none.
-func queryIDOf(query string) string {
-	_, ids, err := chapi.FilterQuery(query, "query_id", func(string) bool { return false })
-	if err != nil || len(ids) == 0 {
-		return ""
+// oneQueryID leaves exactly one query_id in a raw query, the client's first non-empty one or a new
+// one, and returns it; the cancel must name the query ClickHouse runs, and ClickHouse takes the first.
+// replace_running_query likewise keeps only the client's first value.
+func oneQueryID(query string) (string, string) {
+	query, ids, _ := chapi.FilterQuery(query, "query_id", func(string) bool { return false })
+	query, replace, _ := chapi.FilterQuery(query, "replace_running_query", func(string) bool { return false })
+	id := ""
+	for _, v := range ids {
+		if v != "" {
+			id = v
+			break
+		}
 	}
-	return ids[len(ids)-1]
+	if id == "" {
+		id = "chauth-" + rand.Text()
+	}
+	if len(replace) > 0 {
+		query = chapi.AppendParam(query, "replace_running_query", replace[0])
+	}
+	return chapi.AppendParam(query, "query_id", id), id
 }
 
 // closeAfter ends the connection with this answer and stops reading the request: otherwise the
