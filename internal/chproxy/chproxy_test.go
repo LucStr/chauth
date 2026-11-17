@@ -69,6 +69,7 @@ func mustRoot(t *testing.T, stmt string) string {
 }
 
 type harness struct {
+	ctx     context.Context
 	srv     *Server
 	cfg     *chconfig.Config
 	native  string
@@ -80,6 +81,20 @@ type harness struct {
 }
 
 func start(t *testing.T, rules string, mutate func(*chconfig.Config)) *harness {
+	t.Helper()
+	h := newHarness(t, rules, mutate)
+	ctx := context.Background()
+	h.srv.Start(h.ctx)
+	for deadline := time.Now().Add(20 * time.Second); h.srv.Ready(ctx) != nil; time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("not ready: %v", h.srv.Ready(ctx))
+		}
+	}
+	return h
+}
+
+// newHarness builds and serves a Server without starting its instances.
+func newHarness(t *testing.T, rules string, mutate func(*chconfig.Config)) *harness {
 	t.Helper()
 	cfg := &chconfig.Config{
 		Listen:     chconfig.Listen{Native: "127.0.0.1:9440", HTTP: "127.0.0.1:8443"},
@@ -116,16 +131,10 @@ func start(t *testing.T, rules string, mutate func(*chconfig.Config)) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv.Start(ctx)
-	for deadline := time.Now().Add(20 * time.Second); srv.Ready(ctx) != nil; time.Sleep(20 * time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatalf("not ready: %v", srv.Ready(ctx))
-		}
-	}
 	nativeLn, _ := net.Listen("tcp", "127.0.0.1:0")
 	httpLn, _ := net.Listen("tcp", "127.0.0.1:0")
 	hs := srv.NewHTTPServer()
-	h := &harness{srv: srv, cfg: cfg, native: nativeLn.Addr().String(), url: "https://" + httpLn.Addr().String(), store: store, audit: audit, cancel: cancel, stopped: make(chan struct{})}
+	h := &harness{ctx: ctx, srv: srv, cfg: cfg, native: nativeLn.Addr().String(), url: "https://" + httpLn.Addr().String(), store: store, audit: audit, cancel: cancel, stopped: make(chan struct{})}
 	go func() { _ = hs.ServeTLS(httpLn, "", "") }()
 	go func() {
 		defer close(h.stopped)
@@ -755,7 +764,7 @@ func getJSON(t *testing.T, url, tok string, v any) int {
 	return resp.StatusCode
 }
 
-// auditLog keeps the connect and disconnect lines of the server's JSON log.
+// auditLog keeps the connect, disconnect and instance readiness lines of the server's JSON log.
 type auditLog struct {
 	mu    sync.Mutex
 	lines []map[string]any
@@ -763,7 +772,7 @@ type auditLog struct {
 
 func (l *auditLog) Write(p []byte) (int, error) {
 	var line map[string]any
-	if json.Unmarshal(p, &line) == nil && (line["msg"] == "connect" || line["msg"] == "disconnect") {
+	if json.Unmarshal(p, &line) == nil && (line["msg"] == "connect" || line["msg"] == "disconnect" || strings.HasPrefix(fmt.Sprint(line["msg"]), "instance ")) {
 		l.mu.Lock()
 		l.lines = append(l.lines, line)
 		l.mu.Unlock()
@@ -1017,6 +1026,7 @@ func TestMixedCaseDatabase(t *testing.T) {
 	})
 	h := start(t, binding("mixed", "main.Mixed.read", user(chtest.User)), func(c *chconfig.Config) {
 		c.Instances[0].Databases = append(c.Instances[0].Databases, "Mixed")
+		c.Instances[0].ReadOnlyDatabases = append(c.Instances[0].ReadOnlyDatabases, "Mixed")
 	})
 	tok := shared.Issuer.Token(chtest.Claims{})
 	ctx := context.Background()
@@ -1433,4 +1443,66 @@ func TestUnauthenticatedConnectionsClose(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestSelfTest: an instance is ready only while a temp user with every grantable role can be created,
+// granted, logged in as and dropped; a failure names its step, and no self-test user stays.
+func TestSelfTest(t *testing.T) {
+	mustRoot(t, "CREATE ROLE chauth_noadmin")
+	mustRoot(t, "GRANT chauth_noadmin TO chauth_admin")
+	t.Cleanup(func() { mustRoot(t, "DROP ROLE IF EXISTS chauth_noadmin") })
+	selfTestUsers := func(h *harness) string {
+		return mustRoot(t, "SELECT count() FROM system.users WHERE startsWith(name, 'chauth_tmp_selftest_"+h.srv.instances["main"].users.Nonce()+"')")
+	}
+	tests := []struct {
+		name        string
+		mutate      func(*chconfig.Config)
+		weakPass    bool
+		step, error string
+		fix         string
+	}{
+		{"password rejected by the policy", nil, true, "self-test: create temp user", "Invalid password", ""},
+		{"a database's role does not exist", func(c *chconfig.Config) { c.Instances[0].Databases = append(c.Instances[0].Databases, "nodb") },
+			false, "self-test: grant roles to temp user", "chauth_nodb_read", ""},
+		{"admin lacks ADMIN OPTION on a role", func(c *chconfig.Config) { c.Instances[0].Roles = append(c.Instances[0].Roles, "chauth_noadmin") },
+			false, "self-test: grant roles to temp user", "chauth_noadmin", "GRANT chauth_noadmin TO chauth_admin WITH ADMIN OPTION"},
+		{"host restriction excludes chauth", func(c *chconfig.Config) { c.Instances[0].TempUserHostIPs = []string{"192.0.2.0/24"} },
+			false, "self-test: first login of temp user", "code 516", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			h := newHarness(t, coreRead, tt.mutate)
+			if tt.weakPass {
+				in := h.srv.instances["main"]
+				in.users = chusers.NewManager(in.admin, in.cfg, chusers.Options{LeaseDuration: time.Hour, MaxConnectionAge: time.Hour,
+					IdleTTL: time.Minute, Password: func() string { return "abcdefghijklmnopqrstuvwxyz012345" }})
+			}
+			h.srv.Start(h.ctx)
+			waitFor(t, "instance not ready", func() bool { return len(h.audit.all("instance not ready")) > 0 })
+			line := h.audit.all("instance not ready")[0]
+			if line["step"] != tt.step || !strings.Contains(fmt.Sprint(line["error"]), tt.error) {
+				t.Errorf("not-ready line %v, want step %q and an error with %q", line, tt.step, tt.error)
+			}
+			if err := h.srv.Ready(context.Background()); err == nil {
+				t.Error("ready although the self-test fails")
+			}
+			if n := selfTestUsers(h); n != "0" {
+				t.Errorf("%s self-test users left", n)
+			}
+			if tt.fix != "" {
+				mustRoot(t, tt.fix)
+				waitFor(t, "ready after the fix", func() bool { return h.srv.Ready(context.Background()) == nil })
+			}
+			if n := len(h.audit.all("instance not ready")); n != 1 {
+				t.Errorf("%d not-ready lines, want one per change of state", n)
+			}
+		})
+	}
+	t.Run("passes", func(t *testing.T) {
+		h := start(t, coreRead, nil)
+		if n := selfTestUsers(h); n != "0" || len(h.audit.all("instance ready")) != 1 {
+			t.Errorf("%s self-test users left, ready lines %v", n, h.audit.all("instance ready"))
+		}
+	})
 }

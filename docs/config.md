@@ -33,6 +33,7 @@ chauth connect   # then: clickhouse-client -d prod/core, curl localhost:8123 --d
 | `limits.leaseDuration` | half of `maxConnectionAge` | how long one temp user is handed out |
 | `limits.tempUserIdleTTL` | `5m` | an unused temp user is dropped after this |
 | `limits.sweepInterval` | `1m` | sweep of expired temp users of any process |
+| `limits.selfTestInterval` | `10m` | how often each instance's temp-user path is proven again ([readiness](#readiness)); must be positive |
 | `limits.maxConnectionsPerUser` / `maxConnectionsPerTempUser` | `50` / `20` | concurrency caps |
 | `limits.handshakeTimeout` / `preAuthMaxBytes` | `10s` / `65536` | before the token is accepted: TLS plus Hello, or TLS plus request headers |
 | `limits.maxPreAuthConnections` | `512` | native connections still before a verified token, TLS handshake included; one more is closed at once |
@@ -103,6 +104,24 @@ one included, is in that environment ([ADR 0005](adr/0005-no-default-environment
 login for two databases, the read-only database `system` and one named role; the tests run it as is
 and the README shows it verbatim, so its admin grants are the complete set chauth needs. The admin
 needs no `ALTER USER`, no `KILL QUERY`, no row policy and no direct grants.
+
+## Readiness
+
+`GET /readyz` answers 200 once the issuer's keys and a valid rules set are loaded and every instance
+is ready. An instance is ready after the admin login works, a first sweep ran and a self-test passed:
+serve creates `<tempUserPrefix>selftest_<pod><random>` with the same statement real temp users get
+(generated password, a `VALID UNTIL` minutes ahead, `tempUserHostIPs`, `log_comment` and
+`readonly = 2` as `CONST`), grants it in one statement every role the instance can hand out (each
+database's roles at both levels after `readOnlyDatabases`, plus `roles`), logs in as it the way a new
+temp user is first logged in, and drops it. Until it passes, retried with backoff up to 30 s, the
+instance refuses connections with 210 / 503. It repeats every `limits.selfTestInterval`; a failure
+makes the instance not ready until a run passes again. Each change logs once: `instance ready` with
+the roles, or `instance not ready` with `step` (`admin login`, `sweep`, `self-test: create temp user`,
+`self-test: grant roles to temp user`, `self-test: first login of temp user`, `self-test: drop temp
+user`) and ClickHouse's `error`. A login failure (516) means the password, the `HOST IP` or a replica
+the user has not reached within 10 s. The metrics `chauth.selftest.ok` (1 or 0) and
+`chauth.selftest.time` (Unix seconds) per `chauth.instance` hold the last result. The self-test user
+is never handed out; one left by a crash expires and the sweep drops it.
 
 ## Discovery and access
 

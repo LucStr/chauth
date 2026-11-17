@@ -94,35 +94,61 @@ func New(cfg *chconfig.Config, verifier *token.Verifier, store *rbac.Store, tlsC
 	return s, nil
 }
 
-// Start logs in to every instance as the admin, sweeps expired temp users and starts the periodic
-// sweep, retrying until each succeeds; an instance refuses connections until then.
+// Start makes each instance ready once the admin login, a sweep of expired temp users and a self-test
+// pass, retrying with backoff; the self-test then repeats every selfTestInterval and gates readiness.
 func (s *Server) Start(ctx context.Context) {
 	for _, in := range s.instances {
-		go func() {
-			for wait := time.Second; ; wait = min(2*wait, 30*time.Second) {
-				err := in.admin.Ping(ctx)
-				if err == nil {
-					var n int
-					if n, err = in.users.Sweep(ctx); err == nil {
-						go in.users.Run(ctx, time.Duration(s.cfg.Limits.SweepInterval))
-						in.ready.Store(true)
-						s.log.Info("instance ready", "instance", in.cfg.Name, "swept", n, "pod", in.users.Nonce())
-						return
-					}
-				}
-				s.log.Warn("instance not ready", "instance", in.cfg.Name, "error", err)
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(wait):
-				}
+		go s.watch(ctx, in)
+	}
+}
+
+func (s *Server) watch(ctx context.Context, in *instance) {
+	roles := in.cfg.GrantableRoles()
+	interval := time.Duration(s.cfg.Limits.SelfTestInterval)
+	swept, state := -1, ""
+	for wait := time.Second; ; {
+		step, err := "admin login", in.admin.Ping(ctx)
+		if err == nil && swept < 0 {
+			step = "sweep"
+			if swept, err = in.users.Sweep(ctx); err == nil {
+				go in.users.Run(ctx, time.Duration(s.cfg.Limits.SweepInterval))
+			} else {
+				swept = -1
 			}
-		}()
+		}
+		if err == nil {
+			step, err = "self-test", in.users.SelfTest(ctx, roles)
+			if se := (*chusers.StepError)(nil); errors.As(err, &se) {
+				step, err = "self-test: "+se.Step, se.Err
+			}
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		next := interval
+		if err == nil {
+			in.ready.Store(true)
+			if state != "ready" {
+				s.log.Info("instance ready", "instance", in.cfg.Name, "swept", swept, "roles", roles, "pod", in.users.Nonce())
+			}
+			state, wait = "ready", time.Second
+		} else {
+			in.ready.Store(false)
+			if state != step {
+				s.log.Warn("instance not ready", "instance", in.cfg.Name, "step", step, "error", err)
+			}
+			state, next, wait = step, min(wait, interval), min(2*wait, 30*time.Second)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(next):
+		}
 	}
 }
 
 // Ready reports whether the issuer's keys and a valid set of access rules are loaded and every
-// instance accepts the admin login.
+// instance passed its last self-test and accepts the admin login.
 func (s *Server) Ready(ctx context.Context) error {
 	if !s.verifier.Ready() {
 		return errors.New("oidc keys not loaded")

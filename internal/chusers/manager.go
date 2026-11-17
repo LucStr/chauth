@@ -21,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 
 	"github.com/LucStr/chauth/internal/chconfig"
@@ -80,6 +81,8 @@ type Manager struct {
 
 	created, dropped, dropFailed metric.Int64Counter
 	live                         metric.Int64UpDownCounter
+	selfTestOK, selfTestTime     metric.Int64Gauge
+	instance                     metric.MeasurementOption
 }
 
 type entry struct {
@@ -120,10 +123,13 @@ func NewManager(admin *Admin, in chconfig.Instance, opts Options) *Manager {
 	dropped, _ := meter.Int64Counter("chauth.users.dropped", metric.WithDescription("Temp users dropped"))
 	failed, _ := meter.Int64Counter("chauth.users.drop_failed", metric.WithDescription("Temp users that could not be dropped"))
 	live, _ := meter.Int64UpDownCounter("chauth.users.live", metric.WithDescription("Temp users this process holds"))
+	ok, _ := meter.Int64Gauge("chauth.selftest.ok", metric.WithDescription("1 when the last temp-user self-test passed, else 0"))
+	at, _ := meter.Int64Gauge("chauth.selftest.time", metric.WithDescription("When the last temp-user self-test finished"), metric.WithUnit("s"))
 	return &Manager{
 		admin: admin, prefix: in.TempUserPrefix, hosts: in.TempUserHostIPs, opts: opts, nonce: randomName(6),
 		current: map[string]*entry{}, byName: map[string]*entry{}, retry: map[string]bool{},
 		created: created, dropped: dropped, dropFailed: failed, live: live,
+		selfTestOK: ok, selfTestTime: at, instance: metric.WithAttributes(attribute.String("chauth.instance", in.Name)),
 	}
 }
 
@@ -257,7 +263,7 @@ func (m *Manager) create(ctx context.Context, e *entry, k Key) error {
 		b.WriteString(", readonly = 2 CONST")
 	}
 	if err := m.admin.Exec(ctx, b.String()); err != nil {
-		return fmt.Errorf("create temp user: %w", err)
+		return &StepError{Step: "create temp user", Err: err}
 	}
 	m.created.Add(ctx, 1)
 	m.live.Add(ctx, 1)
@@ -267,9 +273,9 @@ func (m *Manager) create(ctx context.Context, e *entry, k Key) error {
 	}
 	err := m.admin.Exec(ctx, "GRANT "+strings.Join(quoted, ", ")+" TO "+Ident(e.name))
 	if err != nil {
-		err = fmt.Errorf("grant roles to temp user: %w", err)
-	} else {
-		err = m.probe(ctx, e)
+		err = &StepError{Step: "grant roles to temp user", Err: err}
+	} else if err = m.probe(ctx, e); err != nil {
+		err = &StepError{Step: "first login of temp user", Err: err}
 	}
 	if err != nil {
 		m.drop(context.WithoutCancel(ctx), e.name)
@@ -284,10 +290,7 @@ func (m *Manager) probe(ctx context.Context, e *entry) error {
 	for wait := 20 * time.Millisecond; ; wait = min(2*wait, time.Second) {
 		err := m.admin.Login(ctx, e.name, e.password)
 		if err == nil || !isCode(err, chwire.CodeAuthenticationFailed) || time.Now().Add(wait).After(deadline) {
-			if err != nil {
-				return fmt.Errorf("first login of temp user: %w", err)
-			}
-			return nil
+			return err
 		}
 		select {
 		case <-ctx.Done():
@@ -297,7 +300,7 @@ func (m *Manager) probe(ctx context.Context, e *entry) error {
 	}
 }
 
-func (m *Manager) drop(ctx context.Context, name string) {
+func (m *Manager) drop(ctx context.Context, name string) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if err := m.admin.Exec(ctx, "DROP USER IF EXISTS "+Ident(name)); err != nil {
@@ -306,13 +309,50 @@ func (m *Manager) drop(ctx context.Context, name string) {
 		m.mu.Lock()
 		m.retry[name] = true
 		m.mu.Unlock()
-		return
+		return err
 	}
 	m.dropped.Add(ctx, 1)
 	m.live.Add(ctx, -1)
 	m.mu.Lock()
 	delete(m.retry, name)
 	m.mu.Unlock()
+	return nil
+}
+
+// StepError is a failed step of creating, granting, logging in as or dropping a temp user.
+type StepError struct {
+	Step string
+	Err  error
+}
+
+func (e *StepError) Error() string { return e.Step + ": " + e.Err.Error() }
+func (e *StepError) Unwrap() error { return e.Err }
+
+// SelfTest creates a temp user the way Acquire does, with roles, logs in as it and drops it. The user
+// is never handed out; one left by a crash expires within minutes and the sweep drops it.
+func (m *Manager) SelfTest(ctx context.Context, roles []string) error {
+	k := Key{Subject: "selftest", Email: "chauth self-test", Level: rbac.Read, Roles: roles}
+	err := checkKey(k)
+	if err == nil {
+		e := &entry{name: m.prefix + "selftest_" + m.nonce + randomName(6), password: m.opts.Password()}
+		e.validUntil = time.Now().Add(m.opts.ProbeTimeout + validGrace)
+		if err = m.create(ctx, e, k); err == nil {
+			if derr := m.drop(context.WithoutCancel(ctx), e.name); derr != nil {
+				err = &StepError{Step: "drop temp user", Err: derr}
+			}
+		} else if se := (*StepError)(nil); errors.As(err, &se) && se.Step == "create temp user" {
+			dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			_ = m.admin.Exec(dctx, "DROP USER IF EXISTS "+Ident(e.name))
+			cancel()
+		}
+	}
+	ok := int64(0)
+	if err == nil {
+		ok = 1
+	}
+	m.selfTestOK.Record(ctx, ok, m.instance)
+	m.selfTestTime.Record(ctx, time.Now().Unix(), m.instance)
+	return err
 }
 
 // Sweep drops temp users of any process whose VALID UNTIL has passed, and retries this process's

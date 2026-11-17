@@ -84,7 +84,8 @@ docker run -v /etc/chauth:/etc/chauth -p 9440:9440 -p 8443:8443 -p 8080:8080 \
 
 The image runs as non-root and needs no writable filesystem. `GET :8080/healthz` answers while the
 process runs, `GET :8080/readyz` once the issuer's keys and a valid rules set are loaded and every
-instance accepts the admin login. On the HTTPS port, `GET /.well-known/chauth` publishes the
+instance passed a self-test: create a temp user with every role chauth can grant, log in as it, drop it
+([readiness](docs/config.md#readiness)). On the HTTPS port, `GET /.well-known/chauth` publishes the
 addresses, issuer, audience, scopes and instances for connectors, `GET /v1/access` with a bearer
 token lists what that token reaches, and `GET /ping` answers `Ok.` without a token
 ([shapes](docs/config.md#discovery-and-access)). Every native connection logs a `connect` line when
@@ -147,7 +148,7 @@ GRANT SELECT(name, valid_until) ON system.users TO chauth_admin;
 - `CREATE USER, DROP USER ON chauth_tmp_*` lets the admin create and drop only users with the
   temp-user prefix (`tempUserPrefix`).
 - Every role a temp user may get must be granted to the admin `WITH ADMIN OPTION`; a role chauth
-  cannot grant fails the connection.
+  cannot grant keeps the instance not ready.
 - `SELECT(name, valid_until) ON system.users` lets the sweep find expired temp users. The sweep
   itself keeps to names with the prefix; there is deliberately no row policy on `system.users`,
   because a row policy on a system table hides its rows from every user without one.
