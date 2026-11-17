@@ -198,8 +198,9 @@ config: [`docs/config.md`](docs/config.md).
 - An HTTP request whose client goes away has its upstream query cancelled: serve gives every
   forwarded request a `query_id` (keeping the client's) and replaces it, as the temp user, with an
   empty query. On shutdown serve stops accepting, gives running HTTP requests `shutdownGrace` (10 s),
-  cuts the rest and drops its temp users within 10 s more; set the termination grace period above
-  `shutdownGrace` + 10 s ([shutdown](docs/config.md#shutdown)).
+  cuts the rest, cancels their queries (up to 5 s) and drops its temp users (up to 10 s); set the
+  termination grace period above `shutdownGrace` + 15 s, about 25 s by default
+  ([shutdown](docs/config.md#shutdown)).
 - The admin user can grant or revoke the chauth roles (every role it holds `WITH ADMIN OPTION`) on
   any existing ClickHouse user, not only on temp users; keep its credentials with chauth alone and
   limit it by `HOST IP`.

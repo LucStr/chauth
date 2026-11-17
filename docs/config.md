@@ -152,10 +152,11 @@ because `clickhouse-client` answers it with a password prompt.
 
 On SIGTERM or SIGINT serve stops accepting on both ports, lets running HTTP requests finish for
 `limits.shutdownGrace` (10 s), then cuts every remaining native and HTTP connection, cancels the
-upstream queries of cut HTTP requests, and drops the temp users this process created within another
-10 s before it exits. A deployment's termination grace period (Kubernetes: 30 s by default) must
-exceed `shutdownGrace` + 10 s, or the process is killed before it drops its temp users; the sweep of
-another instance drops them only once their `VALID UNTIL` has passed.
+upstream queries of cut HTTP requests (at most 5 s), and drops the temp users this process created
+(at most 10 s) before it exits. It therefore stops within `shutdownGrace` + 5 s + 10 s, about 25 s
+by default. A deployment's termination grace period (Kubernetes: 30 s by default) must exceed that
+bound, or the process is killed before it drops its temp users; the sweep of another instance drops
+them only once their `VALID UNTIL` has passed.
 
 ## Connect config
 

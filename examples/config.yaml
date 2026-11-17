@@ -39,7 +39,7 @@ limits:
   maxPreAuthConnections: 512   # native connections still before a verified token; more are closed at once
   maxPreAuthConnectionsPerIP: 0   # the same per client address; 0 is off (keep it off behind an address-rewriting load balancer)
   maxHTTPConnections: 2048     # open connections on the HTTPS port
-  shutdownGrace: 10s           # running HTTP requests may finish this long on SIGTERM; then +10s to drop temp users
+  shutdownGrace: 10s           # running HTTP requests may finish this long on SIGTERM; stop takes up to this + 15s
 
 instances:
   - name: main                                     # required; grants and built-in roles use it
