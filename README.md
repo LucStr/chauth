@@ -138,7 +138,7 @@ GRANT REMOTE ON *.* TO chauth_querylog_read;
 
 -- The admin login of credentialsFile. In production add HOST IP '<network chauth connects from>'.
 -- No ALTER USER: ALTER USER <prefix>x RENAME TO y passes the prefix check and leaves the prefix.
-CREATE USER chauth_admin IDENTIFIED WITH sha256_password BY 'admin-secret';
+CREATE USER chauth_admin IDENTIFIED WITH sha256_password BY 'Admin-secret-1';
 GRANT CREATE USER, DROP USER ON chauth_tmp_* TO chauth_admin;
 GRANT chauth_core_read, chauth_core_write, chauth_otel_read, chauth_otel_write, chauth_system_read, chauth_querylog_read TO chauth_admin WITH ADMIN OPTION;
 GRANT SELECT(name, valid_until) ON system.users TO chauth_admin;

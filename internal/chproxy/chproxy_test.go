@@ -450,14 +450,14 @@ func TestHTTPCredentialStripping(t *testing.T) {
 		header http.Header
 		status int
 	}{
-		{"user and password parameters", "user=default&password=root-secret", nil, 200},
-		{"upper case parameters", "USER=default&PassWord=root-secret", nil, 200},
-		{"escaped parameter name", "%75ser=default&p%61ssword=root-secret", nil, 200},
-		{"duplicate user parameters", "user=x&user=default&password=root-secret", nil, 200},
+		{"user and password parameters", "user=default&password=Root-secret-1", nil, 200},
+		{"upper case parameters", "USER=default&PassWord=Root-secret-1", nil, 200},
+		{"escaped parameter name", "%75ser=default&p%61ssword=Root-secret-1", nil, 200},
+		{"duplicate user parameters", "user=x&user=default&password=Root-secret-1", nil, 200},
 		{"quota_key parameter", "quota_key=q1", nil, 200},
 		{"upper case quota_key", "QUOTA_KEY=q2", nil, 200},
-		{"X-ClickHouse-User and Key", "", http.Header{"X-Clickhouse-User": {"default"}, "X-Clickhouse-Key": {"root-secret"}}, 200},
-		{"lower case headers", "", http.Header{"x-clickhouse-user": {"default"}, "x-clickhouse-key": {"root-secret"}}, 200},
+		{"X-ClickHouse-User and Key", "", http.Header{"X-Clickhouse-User": {"default"}, "X-Clickhouse-Key": {"Root-secret-1"}}, 200},
+		{"lower case headers", "", http.Header{"x-clickhouse-user": {"default"}, "x-clickhouse-key": {"Root-secret-1"}}, 200},
 		{"quota header", "", http.Header{"X-Clickhouse-Quota": {"q3"}}, 200},
 		{"certificate auth header", "", http.Header{"X-Clickhouse-Ssl-Certificate-Auth": {"on"}}, 200},
 		{"token as Basic password", "", basic, 200},
@@ -486,7 +486,7 @@ func TestHTTPCredentialStripping(t *testing.T) {
 		})
 	}
 	direct, _ := http.NewRequest(http.MethodPost, "http://"+shared.PlainHTTP+"/?add_http_cors_header=1", strings.NewReader("SELECT 1"))
-	direct.SetBasicAuth("default", "root-secret")
+	direct.SetBasicAuth("default", "Root-secret-1")
 	direct.Header.Set("Origin", "https://evil.example")
 	if resp, err := http.DefaultClient.Do(direct); err != nil || resp.Header.Get("Access-Control-Allow-Origin") == "" {
 		t.Fatalf("ClickHouse itself sent no Access-Control-Allow-Origin (%v); the CORS rows prove nothing", err)
@@ -854,7 +854,7 @@ func TestTempUsers(t *testing.T) {
 	expired := "chauth_tmp_gone0000_zzzzzzaaaaaa"
 	outside := []string{"outside_expired", "chauth_tmpx_expired", "Chauth_tmp_expired"}
 	for _, u := range append(outside, expired) {
-		mustRoot(t, "CREATE USER "+u+" IDENTIFIED WITH sha256_password BY 'x' VALID UNTIL '2020-01-01 00:00:00 UTC'")
+		mustRoot(t, "CREATE USER "+u+" IDENTIFIED WITH sha256_password BY 'Outside-secret-1' VALID UNTIL '2020-01-01 00:00:00 UTC'")
 	}
 	defer mustRoot(t, "DROP USER IF EXISTS "+strings.Join(outside, ", "))
 	if _, err := m.Sweep(ctx); err != nil {
@@ -869,7 +869,7 @@ func TestTempUsers(t *testing.T) {
 			t.Errorf("sweep acted on %s, which lacks the prefix", u)
 		}
 	}
-	if err := admin.Exec(ctx, "CREATE USER outside_prefix IDENTIFIED WITH sha256_password BY 'x'"); err == nil {
+	if err := admin.Exec(ctx, "CREATE USER outside_prefix IDENTIFIED WITH sha256_password BY 'Outside-secret-1'"); err == nil {
 		t.Error("admin created a user outside the prefix")
 	}
 

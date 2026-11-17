@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"slices"
 	"strings"
 	"sync"
@@ -57,6 +58,8 @@ type Options struct {
 	// ProbeTimeout bounds the retries of the first login of a new user.
 	ProbeTimeout time.Duration
 	Log          *slog.Logger
+	// Password generates temp-user passwords; nil is the built-in generator.
+	Password func() string
 }
 
 // validGrace is added to a user's longest possible use for its VALID UNTIL.
@@ -109,6 +112,9 @@ func NewManager(admin *Admin, in chconfig.Instance, opts Options) *Manager {
 	if opts.Log == nil {
 		opts.Log = slog.Default()
 	}
+	if opts.Password == nil {
+		opts.Password = password
+	}
 	meter := otel.Meter("github.com/LucStr/chauth/internal/chusers")
 	created, _ := meter.Int64Counter("chauth.users.created", metric.WithDescription("Temp users created"))
 	dropped, _ := meter.Int64Counter("chauth.users.dropped", metric.WithDescription("Temp users dropped"))
@@ -137,7 +143,7 @@ func (m *Manager) Acquire(ctx context.Context, k Key) (*Lease, error) {
 	creator := false
 	if e == nil || e.refs >= m.opts.MaxRefs || !now.Before(e.leaseEnd) || failed(e) {
 		e = &entry{
-			name: m.prefix + short(k.Subject) + "_" + m.nonce + randomName(6), password: randomName(32), key: id,
+			name: m.prefix + short(k.Subject) + "_" + m.nonce + randomName(6), password: m.opts.Password(), key: id,
 			leaseEnd: now.Add(m.opts.LeaseDuration), ready: make(chan struct{}),
 		}
 		e.validUntil = e.leaseEnd.Add(m.opts.MaxConnectionAge + validGrace)
@@ -465,4 +471,33 @@ func randomName(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
 	return lowerBase32.EncodeToString(b)[:n]
+}
+
+// passwordClasses each give at least two characters of every password; the special characters need
+// no quoting in a SQL literal, a URL or a shell.
+var passwordClasses = []string{"ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz", "0123456789", "!#%*+-=_"}
+
+// password is 32 random characters with at least two of every class, in random positions.
+func password() string {
+	all := strings.Join(passwordClasses, "")
+	b := make([]byte, 0, 32)
+	for _, class := range passwordClasses {
+		b = append(b, class[randomInt(len(class))], class[randomInt(len(class))])
+	}
+	for len(b) < cap(b) {
+		b = append(b, all[randomInt(len(all))])
+	}
+	for i := len(b) - 1; i > 0; i-- {
+		j := randomInt(i + 1)
+		b[i], b[j] = b[j], b[i]
+	}
+	return string(b)
+}
+
+func randomInt(n int) int {
+	v, err := rand.Int(rand.Reader, big.NewInt(int64(n)))
+	if err != nil {
+		panic(err)
+	}
+	return int(v.Int64())
 }
