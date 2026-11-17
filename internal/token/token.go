@@ -3,16 +3,20 @@ package token
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/go-jose/go-jose/v4"
 
 	"github.com/LucStr/chauth/internal/config"
 )
@@ -30,6 +34,7 @@ type Claims struct {
 type Verifier struct {
 	cfg      config.OIDC
 	verifier atomic.Pointer[oidc.IDTokenVerifier]
+	keys     atomic.Pointer[keySet]
 }
 
 func NewVerifier(cfg config.OIDC) *Verifier { return &Verifier{cfg: cfg} }
@@ -56,12 +61,103 @@ func (v *Verifier) discover(ctx context.Context) error {
 		return err
 	}
 	var meta struct {
-		JWKSURL string `json:"jwks_uri"`
+		Issuer  string   `json:"issuer"`
+		JWKSURL string   `json:"jwks_uri"`
+		Algs    []string `json:"id_token_signing_alg_values_supported"`
 	}
 	if err := provider.Claims(&meta); err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, meta.JWKSURL, nil)
+	var algs []string
+	for _, a := range meta.Algs {
+		if slices.Contains(asymmetricAlgs, jose.SignatureAlgorithm(a)) {
+			algs = append(algs, a)
+		}
+	}
+	if len(algs) == 0 {
+		algs = []string{oidc.RS256}
+	}
+	keys := &keySet{url: meta.JWKSURL, every: refetchEvery}
+	if err := keys.fetch(ctx); err != nil {
+		return err
+	}
+	v.keys.Store(keys)
+	v.verifier.Store(oidc.NewVerifier(meta.Issuer, keys, &oidc.Config{ClientID: v.cfg.Audience, SupportedSigningAlgs: algs}))
+	return nil
+}
+
+var asymmetricAlgs = []jose.SignatureAlgorithm{jose.RS256, jose.RS384, jose.RS512, jose.ES256, jose.ES384, jose.ES512,
+	jose.PS256, jose.PS384, jose.PS512, jose.EdDSA}
+
+// refetchEvery bounds how often a token signed by an unknown key makes chauth fetch the key set.
+const refetchEvery = 10 * time.Second
+
+// keySet is the issuer's JWKS. A token whose key is not in it triggers at most one fetch per
+// every; tokens in between fail without one, so unauthenticated clients cannot drive fetches.
+type keySet struct {
+	url   string
+	every time.Duration
+
+	fetchMu   sync.Mutex
+	mu        sync.Mutex
+	keys      []jose.JSONWebKey
+	fetchedAt time.Time
+}
+
+func (k *keySet) VerifySignature(ctx context.Context, raw string) ([]byte, error) {
+	jws, err := jose.ParseSigned(raw, asymmetricAlgs)
+	if err != nil || len(jws.Signatures) != 1 {
+		return nil, errors.New("malformed token")
+	}
+	kid := jws.Signatures[0].Header.KeyID
+	if payload, ok := k.verify(jws, kid); ok {
+		return payload, nil
+	}
+	k.mu.Lock()
+	due := time.Since(k.fetchedAt) >= k.every
+	k.mu.Unlock()
+	if !due {
+		return nil, errors.New("failed to verify signature")
+	}
+	if err := k.fetch(ctx); err != nil {
+		return nil, fmt.Errorf("fetch keys: %w", err)
+	}
+	if payload, ok := k.verify(jws, kid); ok {
+		return payload, nil
+	}
+	return nil, errors.New("failed to verify signature")
+}
+
+func (k *keySet) verify(jws *jose.JSONWebSignature, kid string) ([]byte, bool) {
+	k.mu.Lock()
+	keys := k.keys
+	k.mu.Unlock()
+	for _, key := range keys {
+		if kid == "" || key.KeyID == kid {
+			if payload, err := jws.Verify(&key); err == nil {
+				return payload, true
+			}
+		}
+	}
+	return nil, false
+}
+
+// fetch replaces the keys unless they were fetched within every; verification goes on meanwhile.
+func (k *keySet) fetch(ctx context.Context) error {
+	k.fetchMu.Lock()
+	defer k.fetchMu.Unlock()
+	k.mu.Lock()
+	recent := !k.fetchedAt.IsZero() && time.Since(k.fetchedAt) < k.every
+	if !recent {
+		k.fetchedAt = time.Now()
+	}
+	k.mu.Unlock()
+	if recent {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, k.url, nil)
 	if err != nil {
 		return err
 	}
@@ -69,11 +165,26 @@ func (v *Verifier) discover(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("GET %s: %s", meta.JWKSURL, resp.Status)
+		return fmt.Errorf("GET %s: %s", k.url, resp.Status)
 	}
-	v.verifier.Store(provider.Verifier(&oidc.Config{ClientID: v.cfg.Audience}))
+	var set struct {
+		Keys []json.RawMessage `json:"keys"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&set); err != nil {
+		return fmt.Errorf("GET %s: %w", k.url, err)
+	}
+	var keys []jose.JSONWebKey
+	for _, raw := range set.Keys {
+		var key jose.JSONWebKey
+		if json.Unmarshal(raw, &key) == nil && key.Use != "enc" && key.IsPublic() {
+			keys = append(keys, key)
+		}
+	}
+	k.mu.Lock()
+	k.keys = keys
+	k.mu.Unlock()
 	return nil
 }
 
