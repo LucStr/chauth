@@ -21,7 +21,8 @@ func TestExampleLoads(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c.OIDC.Scopes.Read != "clickhouse:read" || time.Duration(c.Limits.LeaseDuration) != 6*time.Hour || c.Instances[0].RoleFor("core", rbac.Write) != "chauth_core_write" ||
-		c.Instances[0].RoleFor("system", rbac.Write) != "chauth_system_read" {
+		c.Instances[0].RoleFor("system", rbac.Write) != "chauth_system_read" || time.Duration(c.Limits.SelfTestInterval) != 10*time.Minute ||
+		strings.Join(c.Instances[0].GrantableRoles(), ",") != "chauth_core_read,chauth_core_write,chauth_otel_read,chauth_otel_write,chauth_querylog_read,chauth_system_read" {
 		t.Fatalf("%+v", c)
 	}
 }
@@ -65,6 +66,7 @@ func TestValidate(t *testing.T) {
 		{"mixed-case named role", func(c *Config) { c.Instances[0].Roles = []string{"Chauth_QueryLog"} }, ""},
 		{"negative reload interval", func(c *Config) { c.RBAC.ReloadInterval = -1 }, "rbac.reloadInterval must be positive"},
 		{"negative shutdown grace", func(c *Config) { c.Limits.ShutdownGrace = -1 }, "limits.shutdownGrace must be positive"},
+		{"negative self-test interval", func(c *Config) { c.Limits.SelfTestInterval = -1 }, "limits.selfTestInterval must be positive"},
 		{"negative pre-auth connection cap", func(c *Config) { c.Limits.MaxPreAuthConnectionsPerIP = -1 }, "maxPreAuthConnectionsPerIP must not be negative"},
 		{"negative HTTP connection cap", func(c *Config) { c.Limits.MaxHTTPConnections = -1 }, "maxHTTPConnections must not be negative"},
 	}

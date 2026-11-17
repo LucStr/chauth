@@ -79,12 +79,13 @@ connects with your rights, the same trade-off as other local database proxies.
 
 ```
 docker run -v /etc/chauth:/etc/chauth -p 9440:9440 -p 8443:8443 -p 8080:8080 \
-  ghcr.io/lucstr/chauth:v0.1.0 serve --config /etc/chauth/config.yaml
+  ghcr.io/lucstr/chauth:v0.1.1 serve --config /etc/chauth/config.yaml
 ```
 
 The image runs as non-root and needs no writable filesystem. `GET :8080/healthz` answers while the
 process runs, `GET :8080/readyz` once the issuer's keys and a valid rules set are loaded and every
-instance accepts the admin login. On the HTTPS port, `GET /.well-known/chauth` publishes the
+instance passed a self-test: create a temp user with every role chauth can grant, log in as it, drop it
+([readiness](docs/config.md#readiness)). On the HTTPS port, `GET /.well-known/chauth` publishes the
 addresses, issuer, audience, scopes and instances for connectors, `GET /v1/access` with a bearer
 token lists what that token reaches, and `GET /ping` answers `Ok.` without a token
 ([shapes](docs/config.md#discovery-and-access)). Every native connection logs a `connect` line when
@@ -98,8 +99,8 @@ Binaries for macOS and Linux (amd64, arm64) are attached to each
 quarantined; download it with `curl` or run `xattr -d com.apple.quarantine chauth`.
 
 ```
-curl -fsSL https://github.com/LucStr/chauth/releases/download/v0.1.0/chauth_v0.1.0_darwin_arm64.tar.gz | tar -xz
-./chauth_v0.1.0_darwin_arm64/chauth version
+curl -fsSL https://github.com/LucStr/chauth/releases/download/v0.1.1/chauth_v0.1.1_darwin_arm64.tar.gz | tar -xz
+./chauth_v0.1.1_darwin_arm64/chauth version
 ```
 
 ## Upstream setup
@@ -138,7 +139,7 @@ GRANT REMOTE ON *.* TO chauth_querylog_read;
 
 -- The admin login of credentialsFile. In production add HOST IP '<network chauth connects from>'.
 -- No ALTER USER: ALTER USER <prefix>x RENAME TO y passes the prefix check and leaves the prefix.
-CREATE USER chauth_admin IDENTIFIED WITH sha256_password BY 'admin-secret';
+CREATE USER chauth_admin IDENTIFIED WITH sha256_password BY 'Admin-secret-1';
 GRANT CREATE USER, DROP USER ON chauth_tmp_* TO chauth_admin;
 GRANT chauth_core_read, chauth_core_write, chauth_otel_read, chauth_otel_write, chauth_system_read, chauth_querylog_read TO chauth_admin WITH ADMIN OPTION;
 GRANT SELECT(name, valid_until) ON system.users TO chauth_admin;
@@ -147,7 +148,10 @@ GRANT SELECT(name, valid_until) ON system.users TO chauth_admin;
 - `CREATE USER, DROP USER ON chauth_tmp_*` lets the admin create and drop only users with the
   temp-user prefix (`tempUserPrefix`).
 - Every role a temp user may get must be granted to the admin `WITH ADMIN OPTION`; a role chauth
-  cannot grant fails the connection.
+  cannot grant keeps the instance not ready.
+- Temp-user passwords are 32 random characters with at least two upper-case letters, lower-case
+  letters, digits and characters of `!#%*+-=_` each, which meets ClickHouse Cloud's default password
+  rules; a stricter `password_complexity` on a self-managed server rejects them, and readiness says so.
 - `SELECT(name, valid_until) ON system.users` lets the sweep find expired temp users. The sweep
   itself keeps to names with the prefix; there is deliberately no row policy on `system.users`,
   because a row policy on a system table hides its rows from every user without one.

@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"slices"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 
 	"github.com/LucStr/chauth/internal/chconfig"
@@ -57,6 +59,8 @@ type Options struct {
 	// ProbeTimeout bounds the retries of the first login of a new user.
 	ProbeTimeout time.Duration
 	Log          *slog.Logger
+	// Password generates temp-user passwords; nil is the built-in generator.
+	Password func() string
 }
 
 // validGrace is added to a user's longest possible use for its VALID UNTIL.
@@ -77,10 +81,14 @@ type Manager struct {
 
 	created, dropped, dropFailed metric.Int64Counter
 	live                         metric.Int64UpDownCounter
+	selfTestRuns                 metric.Int64Counter
+	selfTestOK, selfTestTime     metric.Int64Gauge
+	instance                     metric.MeasurementOption
 }
 
 type entry struct {
 	name, password, key  string
+	selfTest             bool
 	leaseEnd, validUntil time.Time
 	refs                 int
 	dropped              bool
@@ -109,15 +117,22 @@ func NewManager(admin *Admin, in chconfig.Instance, opts Options) *Manager {
 	if opts.Log == nil {
 		opts.Log = slog.Default()
 	}
+	if opts.Password == nil {
+		opts.Password = password
+	}
 	meter := otel.Meter("github.com/LucStr/chauth/internal/chusers")
 	created, _ := meter.Int64Counter("chauth.users.created", metric.WithDescription("Temp users created"))
 	dropped, _ := meter.Int64Counter("chauth.users.dropped", metric.WithDescription("Temp users dropped"))
 	failed, _ := meter.Int64Counter("chauth.users.drop_failed", metric.WithDescription("Temp users that could not be dropped"))
 	live, _ := meter.Int64UpDownCounter("chauth.users.live", metric.WithDescription("Temp users this process holds"))
+	runs, _ := meter.Int64Counter("chauth.selftest.runs", metric.WithDescription("Temp-user self-tests by result, pass or fail"))
+	ok, _ := meter.Int64Gauge("chauth.selftest.ok", metric.WithDescription("1 when the last temp-user self-test passed, else 0"))
+	at, _ := meter.Int64Gauge("chauth.selftest.time", metric.WithDescription("When the last temp-user self-test finished"), metric.WithUnit("s"))
 	return &Manager{
 		admin: admin, prefix: in.TempUserPrefix, hosts: in.TempUserHostIPs, opts: opts, nonce: randomName(6),
 		current: map[string]*entry{}, byName: map[string]*entry{}, retry: map[string]bool{},
 		created: created, dropped: dropped, dropFailed: failed, live: live,
+		selfTestRuns: runs, selfTestOK: ok, selfTestTime: at, instance: metric.WithAttributes(attribute.String("chauth.instance", in.Name)),
 	}
 }
 
@@ -137,7 +152,7 @@ func (m *Manager) Acquire(ctx context.Context, k Key) (*Lease, error) {
 	creator := false
 	if e == nil || e.refs >= m.opts.MaxRefs || !now.Before(e.leaseEnd) || failed(e) {
 		e = &entry{
-			name: m.prefix + short(k.Subject) + "_" + m.nonce + randomName(6), password: randomName(32), key: id,
+			name: m.userName(k.Subject), password: m.opts.Password(), key: id,
 			leaseEnd: now.Add(m.opts.LeaseDuration), ready: make(chan struct{}),
 		}
 		e.validUntil = e.leaseEnd.Add(m.opts.MaxConnectionAge + validGrace)
@@ -251,24 +266,36 @@ func (m *Manager) create(ctx context.Context, e *entry, k Key) error {
 		b.WriteString(", readonly = 2 CONST")
 	}
 	if err := m.admin.Exec(ctx, b.String()); err != nil {
-		return fmt.Errorf("create temp user: %w", err)
+		return &StepError{Step: "create temp user", Err: err}
 	}
-	m.created.Add(ctx, 1)
-	m.live.Add(ctx, 1)
+	if !e.selfTest {
+		m.created.Add(ctx, 1)
+		m.live.Add(ctx, 1)
+	}
 	quoted := make([]string, len(k.Roles))
 	for i, r := range k.Roles {
 		quoted[i] = Ident(r)
 	}
 	err := m.admin.Exec(ctx, "GRANT "+strings.Join(quoted, ", ")+" TO "+Ident(e.name))
 	if err != nil {
-		err = fmt.Errorf("grant roles to temp user: %w", err)
-	} else {
-		err = m.probe(ctx, e)
+		err = &StepError{Step: "grant roles to temp user", Err: err}
+	} else if err = m.probe(ctx, e); err != nil {
+		err = &StepError{Step: "first login of temp user", Err: err}
 	}
 	if err != nil {
-		m.drop(context.WithoutCancel(ctx), e.name)
+		_ = m.dropEntry(context.WithoutCancel(ctx), e)
 	}
 	return err
+}
+
+// dropEntry drops e; a self-test user is left out of the metrics and retries of people's users.
+func (m *Manager) dropEntry(ctx context.Context, e *entry) error {
+	if !e.selfTest {
+		return m.drop(ctx, e.name)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	return m.admin.Exec(ctx, "DROP USER IF EXISTS "+Ident(e.name))
 }
 
 // probe logs in as the new user until it works: on a cluster with several replicas the user may not
@@ -278,10 +305,7 @@ func (m *Manager) probe(ctx context.Context, e *entry) error {
 	for wait := 20 * time.Millisecond; ; wait = min(2*wait, time.Second) {
 		err := m.admin.Login(ctx, e.name, e.password)
 		if err == nil || !isCode(err, chwire.CodeAuthenticationFailed) || time.Now().Add(wait).After(deadline) {
-			if err != nil {
-				return fmt.Errorf("first login of temp user: %w", err)
-			}
-			return nil
+			return err
 		}
 		select {
 		case <-ctx.Done():
@@ -291,7 +315,7 @@ func (m *Manager) probe(ctx context.Context, e *entry) error {
 	}
 }
 
-func (m *Manager) drop(ctx context.Context, name string) {
+func (m *Manager) drop(ctx context.Context, name string) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if err := m.admin.Exec(ctx, "DROP USER IF EXISTS "+Ident(name)); err != nil {
@@ -300,13 +324,49 @@ func (m *Manager) drop(ctx context.Context, name string) {
 		m.mu.Lock()
 		m.retry[name] = true
 		m.mu.Unlock()
-		return
+		return err
 	}
 	m.dropped.Add(ctx, 1)
 	m.live.Add(ctx, -1)
 	m.mu.Lock()
 	delete(m.retry, name)
 	m.mu.Unlock()
+	return nil
+}
+
+// StepError is a failed step of creating, granting, logging in as or dropping a temp user.
+type StepError struct {
+	Step string
+	Err  error
+}
+
+func (e *StepError) Error() string { return e.Step + ": " + e.Err.Error() }
+func (e *StepError) Unwrap() error { return e.Err }
+
+// SelfTest creates a temp user the way Acquire does, with roles, logs in as it and drops it. The user
+// is never handed out; one left by a crash expires within minutes and the sweep drops it.
+func (m *Manager) SelfTest(ctx context.Context, roles []string) error {
+	k := Key{Subject: "selftest", Email: "chauth self-test", Level: rbac.Read, Roles: roles}
+	err := checkKey(k)
+	if err == nil {
+		e := &entry{name: m.selfTestName(), password: m.opts.Password(), selfTest: true}
+		e.validUntil = time.Now().Add(m.opts.ProbeTimeout + validGrace)
+		if err = m.create(ctx, e, k); err == nil {
+			if derr := m.dropEntry(context.WithoutCancel(ctx), e); derr != nil {
+				err = &StepError{Step: "drop temp user", Err: derr}
+			}
+		} else if se := (*StepError)(nil); errors.As(err, &se) && se.Step == "create temp user" {
+			_ = m.dropEntry(context.WithoutCancel(ctx), e)
+		}
+	}
+	ok, result := int64(0), "fail"
+	if err == nil {
+		ok, result = 1, "pass"
+	}
+	m.selfTestRuns.Add(ctx, 1, m.instance, metric.WithAttributes(attribute.String("result", result)))
+	m.selfTestOK.Record(ctx, ok, m.instance)
+	m.selfTestTime.Record(ctx, time.Now().Unix(), m.instance)
+	return err
 }
 
 // Sweep drops temp users of any process whose VALID UNTIL has passed, and retries this process's
@@ -438,6 +498,13 @@ func Literal(s string) string {
 	return "'" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(s) + "'"
 }
 
+// userName is a person's temp user: short never starts with '_', so it cannot take selfTestName's shape.
+func (m *Manager) userName(subject string) string {
+	return m.prefix + short(subject) + "_" + m.nonce + randomName(6)
+}
+
+func (m *Manager) selfTestName() string { return m.prefix + "_selftest_" + m.nonce + randomName(6) }
+
 func validName(name string) bool {
 	return name != "" && !strings.ContainsFunc(name, func(r rune) bool {
 		return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_')
@@ -465,4 +532,33 @@ func randomName(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
 	return lowerBase32.EncodeToString(b)[:n]
+}
+
+// passwordClasses each give at least two characters of every password. It travels only in a SQL literal,
+// HTTP Basic auth and the native Hello; never put it into a URL or a command line.
+var passwordClasses = []string{"ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz", "0123456789", "!#%*+-=_"}
+
+// password is 32 random characters with at least two of every class, in random positions.
+func password() string {
+	all := strings.Join(passwordClasses, "")
+	b := make([]byte, 0, 32)
+	for _, class := range passwordClasses {
+		b = append(b, class[randomInt(len(class))], class[randomInt(len(class))])
+	}
+	for len(b) < cap(b) {
+		b = append(b, all[randomInt(len(all))])
+	}
+	for i := len(b) - 1; i > 0; i-- {
+		j := randomInt(i + 1)
+		b[i], b[j] = b[j], b[i]
+	}
+	return string(b)
+}
+
+func randomInt(n int) int {
+	v, err := rand.Int(rand.Reader, big.NewInt(int64(n)))
+	if err != nil {
+		panic(err)
+	}
+	return int(v.Int64())
 }

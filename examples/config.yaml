@@ -32,6 +32,7 @@ limits:
   leaseDuration: 6h            # default half of maxConnectionAge: how long one temp user is handed out
   tempUserIdleTTL: 5m          # a temp user with no open connection is dropped after this
   sweepInterval: 1m            # how often expired temp users of any process are dropped
+  selfTestInterval: 10m        # how often readiness creates, grants, logs in as and drops a test temp user per instance
   maxConnectionsPerUser: 50    # open native connections plus running HTTP requests per subject
   maxConnectionsPerTempUser: 20
   handshakeTimeout: 10s        # TLS plus Hello, or TLS plus request headers

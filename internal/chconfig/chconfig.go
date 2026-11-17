@@ -47,8 +47,10 @@ type Limits struct {
 	// LeaseDuration is how long one temp user is handed out to new connections or requests.
 	LeaseDuration config.Duration `json:"leaseDuration"`
 	// TempUserIdleTTL is how long a temp user with no open connection is kept for reuse.
-	TempUserIdleTTL           config.Duration `json:"tempUserIdleTTL"`
-	SweepInterval             config.Duration `json:"sweepInterval"`
+	TempUserIdleTTL config.Duration `json:"tempUserIdleTTL"`
+	SweepInterval   config.Duration `json:"sweepInterval"`
+	// SelfTestInterval is how often each instance's temp-user path is proven again for readiness.
+	SelfTestInterval          config.Duration `json:"selfTestInterval"`
 	MaxConnectionsPerUser     int             `json:"maxConnectionsPerUser"`
 	MaxConnectionsPerTempUser int             `json:"maxConnectionsPerTempUser"`
 	HandshakeTimeout          config.Duration `json:"handshakeTimeout"`
@@ -137,6 +139,7 @@ func (c *Config) ApplyDefaults() {
 	setDur(&l.LeaseDuration, time.Duration(l.MaxConnectionAge)/2)
 	setDur(&l.TempUserIdleTTL, 5*time.Minute)
 	setDur(&l.SweepInterval, time.Minute)
+	setDur(&l.SelfTestInterval, 10*time.Minute)
 	setDur(&l.HandshakeTimeout, 10*time.Second)
 	setDur(&l.ShutdownGrace, 10*time.Second)
 	setInt(&l.MaxPreAuthConnections, 512)
@@ -184,7 +187,7 @@ func (c *Config) Validate() error {
 	}
 	l := c.Limits
 	for name, d := range map[string]config.Duration{"maxConnectionAge": l.MaxConnectionAge, "leaseDuration": l.LeaseDuration,
-		"tempUserIdleTTL": l.TempUserIdleTTL, "sweepInterval": l.SweepInterval, "handshakeTimeout": l.HandshakeTimeout,
+		"tempUserIdleTTL": l.TempUserIdleTTL, "sweepInterval": l.SweepInterval, "selfTestInterval": l.SelfTestInterval, "handshakeTimeout": l.HandshakeTimeout,
 		"shutdownGrace": l.ShutdownGrace} {
 		if d < 0 {
 			add("limits.%s must be positive", name)
@@ -384,6 +387,17 @@ func (in Instance) UpstreamRoles(g rbac.Granted) []string {
 		if lv > rbac.None {
 			out = append(out, in.RoleFor(db, lv))
 		}
+	}
+	sort.Strings(out)
+	return slices.Compact(out)
+}
+
+// GrantableRoles are every upstream role a temp user on in can get: each database's roles at both
+// levels after Cap, and the named roles; sorted and without duplicates.
+func (in Instance) GrantableRoles() []string {
+	out := slices.Clone(in.Roles)
+	for _, db := range in.Databases {
+		out = append(out, in.RoleFor(db, rbac.Read), in.RoleFor(db, rbac.Write))
 	}
 	sort.Strings(out)
 	return slices.Compact(out)

@@ -40,7 +40,9 @@ const (
 	// Client is the default client_id; CLIClient is the other allowed one.
 	Client    = "example-agent"
 	CLIClient = "example-cli"
-	tlsXML    = `<clickhouse>
+	// RootPassword is the container's default user's; the admin's is in examples/clickhouse-setup.sql.
+	RootPassword = "Root-secret-1"
+	tlsXML       = `<clickhouse>
   <https_port>8443</https_port>
   <tcp_port_secure>9440</tcp_port_secure>
   <openSSL><server>
@@ -49,6 +51,16 @@ const (
     <verificationMode>none</verificationMode>
     <loadDefaultCAFile>false</loadDefaultCAFile>
   </server></openSSL>
+</clickhouse>`
+	// passwordXML mirrors ClickHouse Cloud's default password rules for users created with SQL.
+	passwordXML = `<clickhouse>
+  <password_complexity>
+    <rule><pattern>.{12}</pattern><message>be at least 12 characters long</message></rule>
+    <rule><pattern>\p{N}</pattern><message>contain at least 1 numeric character</message></rule>
+    <rule><pattern>\p{Ll}</pattern><message>contain at least 1 lowercase character</message></rule>
+    <rule><pattern>\p{Lu}</pattern><message>contain at least 1 uppercase character</message></rule>
+    <rule><pattern>[^\p{L}\p{N}]</pattern><message>contain at least 1 special character</message></rule>
+  </password_complexity>
 </clickhouse>`
 )
 
@@ -81,11 +93,12 @@ func Start(dir string) (*Env, func(), error) {
 	ctr, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{Started: true, ContainerRequest: testcontainers.ContainerRequest{
 		Image:        Image,
 		ExposedPorts: []string{"8123/tcp", "8443/tcp", "9440/tcp"},
-		Env:          map[string]string{"CLICKHOUSE_PASSWORD": "root-secret", "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT": "1"},
+		Env:          map[string]string{"CLICKHOUSE_PASSWORD": RootPassword, "CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT": "1"},
 		Files: []testcontainers.ContainerFile{
 			{HostFilePath: e.CertFile, ContainerFilePath: "/etc/clickhouse-server/tls/tls.crt", FileMode: 0o644},
 			{HostFilePath: e.KeyFile, ContainerFilePath: "/etc/clickhouse-server/tls/tls.key", FileMode: 0o644},
 			{Reader: strings.NewReader(tlsXML), ContainerFilePath: "/etc/clickhouse-server/config.d/tls.xml", FileMode: 0o644},
+			{Reader: strings.NewReader(passwordXML), ContainerFilePath: "/etc/clickhouse-server/config.d/password.xml", FileMode: 0o644},
 		},
 		WaitingFor: wait.ForHTTP("/ping").WithPort("8123/tcp").WithStartupTimeout(2 * time.Minute),
 	}})
@@ -113,7 +126,7 @@ func Start(dir string) (*Env, func(), error) {
 		return nil, stop, fmt.Errorf("setup: %w", err)
 	}
 	e.CredFile = filepath.Join(dir, "credentials.json")
-	if err := os.WriteFile(e.CredFile, []byte(`{"username":"chauth_admin","password":"admin-secret"}`), 0o600); err != nil {
+	if err := os.WriteFile(e.CredFile, []byte(`{"username":"chauth_admin","password":"Admin-secret-1"}`), 0o600); err != nil {
 		return nil, stop, err
 	}
 	pemCert, _ := os.ReadFile(e.CertFile)
@@ -156,7 +169,7 @@ func (e *Env) setup() error {
 // Root runs stmt as the container's default user over plain HTTP, bypassing chauth.
 func (e *Env) Root(stmt string) (string, error) {
 	req, _ := http.NewRequest(http.MethodPost, "http://"+e.PlainHTTP+"/", strings.NewReader(stmt))
-	req.SetBasicAuth("default", "root-secret")
+	req.SetBasicAuth("default", RootPassword)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", err

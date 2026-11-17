@@ -33,6 +33,7 @@ chauth connect   # then: clickhouse-client -d prod/core, curl localhost:8123 --d
 | `limits.leaseDuration` | half of `maxConnectionAge` | how long one temp user is handed out |
 | `limits.tempUserIdleTTL` | `5m` | an unused temp user is dropped after this |
 | `limits.sweepInterval` | `1m` | sweep of expired temp users of any process |
+| `limits.selfTestInterval` | `10m` | how often each instance's temp-user path is proven again ([readiness](#readiness)); must be positive |
 | `limits.maxConnectionsPerUser` / `maxConnectionsPerTempUser` | `50` / `20` | concurrency caps |
 | `limits.handshakeTimeout` / `preAuthMaxBytes` | `10s` / `65536` | before the token is accepted: TLS plus Hello, or TLS plus request headers |
 | `limits.maxPreAuthConnections` | `512` | native connections still before a verified token, TLS handshake included; one more is closed at once |
@@ -42,7 +43,7 @@ chauth connect   # then: clickhouse-client -d prod/core, curl localhost:8123 --d
 | `instances[].name` | required | used in grants and built-in role names; no `/` or `.` |
 | `instances[].native` / `.http` | required | upstream `host:port` (native TLS) and `https://` URL |
 | `instances[].tlsMode` | `verify-full` | or `verify-ca`; `caFile` (system roots), `tlsServerName` (the URL's host) |
-| `instances[].databases` | required | databases served; each maps through `roleTemplate` |
+| `instances[].databases` | required | databases served; each maps through `roleTemplate` and needs both its read and its write role upstream, held by the admin `WITH ADMIN OPTION`, unless it is in `readOnlyDatabases` (read role only): the [readiness](#readiness) self-test grants them all |
 | `instances[].readOnlyDatabases` | none | databases where every grant gives only the read role; each must be in `databases` |
 | `instances[].roles` | none | upstream roles a grant may name, granted verbatim (see the warning under [Rules](#rules)) |
 | `instances[].credentialsFile` | required | `{"username", "password"}` of the admin login |
@@ -103,6 +104,28 @@ one included, is in that environment ([ADR 0005](adr/0005-no-default-environment
 login for two databases, the read-only database `system` and one named role; the tests run it as is
 and the README shows it verbatim, so its admin grants are the complete set chauth needs. The admin
 needs no `ALTER USER`, no `KILL QUERY`, no row policy and no direct grants.
+
+## Readiness
+
+`GET /readyz` answers 200 once the issuer's keys and a valid rules set are loaded and every instance
+is ready. An instance is ready after the admin login works, a first sweep ran and a self-test passed:
+serve creates `<tempUserPrefix>_selftest_<pod><random>` (no person's temp user starts with `<tempUserPrefix>_`) with the same statement real temp users get
+(generated password, a `VALID UNTIL` minutes ahead, `tempUserHostIPs`, `log_comment` and
+`readonly = 2` as `CONST`), grants it in one statement every role the instance can hand out (each
+database's roles at both levels after `readOnlyDatabases`, plus `roles`), logs in as it the way a new
+temp user is first logged in, and drops it. Until it passes, retried with backoff up to 5 s, the
+instance refuses connections with 210 / 503. It repeats every `limits.selfTestInterval`. Once ready,
+an instance turns not ready only after 3 failed checks in a row, retried 1 s apart, and then retries
+with backoff up to 5 s; one passing check makes it ready again at once, and open connections and
+running queries are never touched. Each change logs once: `instance ready` with the roles, or
+`instance not ready` with `failures` and the last failure's `step` (`admin login`, `sweep`, `self-test: create temp user`,
+`self-test: grant roles to temp user`, `self-test: first login of temp user`, `self-test: drop temp
+user`) and ClickHouse's `error`. A login failure (516) means the password, the `HOST IP` or a replica
+the user has not reached within 10 s. The metrics `chauth.selftest.ok` (1 or 0) and
+`chauth.selftest.time` (Unix seconds) per `chauth.instance` hold the last result, and
+`chauth.selftest.runs` counts runs by `result` (`pass`, `fail`); self-tests never count in
+`chauth.users.*`. The self-test user
+is never handed out; one left by a crash expires and the sweep drops it.
 
 ## Discovery and access
 
