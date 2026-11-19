@@ -93,6 +93,21 @@ func (a *Admin) Upstream(ctx context.Context, roles []string) (*rbac.Upstream, e
 	if err != nil {
 		return nil, err
 	}
+	creds, err := a.in.Credentials()
+	if err != nil {
+		return nil, err
+	}
+	visible := false
+	err = a.run(ctx, creds.Username, creds.Password, "CHECK GRANT SHOW ROW POLICIES ON *.*", func(line []byte) error {
+		visible = strings.TrimSpace(string(line)) == "1"
+		return nil
+	})
+	if err == nil && !visible {
+		err = errors.New("the admin lacks SHOW ROW POLICIES ON *.*, so system.row_policies may hide policies")
+	}
+	if err != nil {
+		return nil, err
+	}
 	err = a.Rows(ctx, "SELECT DISTINCT database FROM system.row_policies", func(line []byte) error {
 		var row struct {
 			Database string `json:"database"`
