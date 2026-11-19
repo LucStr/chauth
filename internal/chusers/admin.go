@@ -3,6 +3,7 @@ package chusers
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/LucStr/chauth/internal/chconfig"
+	"github.com/LucStr/chauth/internal/rbac"
 )
 
 // Error is a ClickHouse exception returned over HTTP.
@@ -61,6 +63,34 @@ func (a *Admin) Rows(ctx context.Context, query string, row func([]byte) error) 
 		return err
 	}
 	return a.run(ctx, creds.Username, creds.Password, query+" FORMAT JSONEachRow", row)
+}
+
+// RoleGrants reads the own grants of roles from system.grants.
+func (a *Admin) RoleGrants(ctx context.Context, roles []string) ([]rbac.RoleGrant, error) {
+	quoted := make([]string, len(roles))
+	for i, r := range roles {
+		quoted[i] = Literal(r)
+	}
+	out := []rbac.RoleGrant{}
+	err := a.Rows(ctx, "SELECT role_name, access_type, ifNull(database, '') AS database, ifNull(table, '') AS table, "+
+		"column IS NOT NULL AS column, is_partial_revoke FROM system.grants WHERE role_name IN ("+strings.Join(quoted, ", ")+")",
+		func(line []byte) error {
+			var row struct {
+				Role     string `json:"role_name"`
+				Access   string `json:"access_type"`
+				Database string `json:"database"`
+				Table    string `json:"table"`
+				Column   int    `json:"column"`
+				Revoke   int    `json:"is_partial_revoke"`
+			}
+			if err := json.Unmarshal(line, &row); err != nil {
+				return err
+			}
+			out = append(out, rbac.RoleGrant{Role: row.Role, Access: row.Access, Database: row.Database, Table: row.Table,
+				Column: row.Column != 0, PartialRevoke: row.Revoke != 0})
+			return nil
+		})
+	return out, err
 }
 
 // Ping checks that the admin login works.

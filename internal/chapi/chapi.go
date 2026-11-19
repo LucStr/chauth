@@ -16,7 +16,8 @@ const (
 	DiscoveryPath = "/.well-known/chauth"
 	// AccessPath answers []Access for the Bearer token.
 	AccessPath = "/v1/access"
-	// TablesPath answers []Table for the database in its db parameter, for a token that reads it whole.
+	// TablesPath answers []Table for the database in its db parameter: every table for a token that
+	// reaches the whole database, only its declared tables for a token limited to tables.
 	TablesPath = "/v1/tables"
 )
 

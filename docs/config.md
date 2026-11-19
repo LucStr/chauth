@@ -120,7 +120,7 @@ an instance turns not ready only after 3 failed checks in a row, retried 1 s apa
 with backoff up to 5 s; one passing check makes it ready again at once, and open connections and
 running queries are never touched. Each change logs once: `instance ready` with the roles, or
 `instance not ready` with `failures` and the last failure's `step` (`admin login`, `sweep`, `self-test: create temp user`,
-`self-test: grant roles to temp user`, `self-test: grant tables to temp user`, `self-test: first login of temp user`, `self-test: drop temp
+`self-test: grant roles to temp user`, `self-test: grant tables to temp user`, `read role grants`, `self-test: first login of temp user`, `self-test: drop temp
 user`) and ClickHouse's `error`. A login failure (516) means the password, the `HOST IP` or a replica
 the user has not reached within 10 s. The metrics `chauth.selftest.ok` (1 or 0) and
 `chauth.selftest.time` (Unix seconds) per `chauth.instance` hold the last result, and
@@ -189,12 +189,20 @@ level allows (`select` needs read, the rest write) when the token also carries a
 that database, else the bindings after the scope cap; a token whose verbs all exceed it is refused
 on that database. A narrowed run token carries only run rows: that the run stays within consent is
 the issuer's check, not chauth's. A database without a row is not reached. Named roles
-(`instances[].roles`) follow the `*` row's level, and are dropped without one or when any row names
-tables. Run rows on a read-only database give nothing.
+(`instances[].roles`) follow the lowest consent row when a `*` row exists, and are dropped without
+one or when any row names tables. On a read-only database run rows keep only `select`.
+
+A run row's verb is also kept only when the role the binding gives on that database
+(`roleTemplate` at the binding's level after the caps) holds it itself, read from `system.grants`
+after every passing self-test: a grant on the database or the table, or a parent privilege
+(`ALTER` for `ALTER UPDATE`); a column-level grant, a partial revoke touching the table, or a role
+granted to that role count as not holding it. So a direct table grant never reaches past what the
+binding's role reaches.
 
 Tables are granted to the temp user directly (`SELECT`, `INSERT`, `ALTER UPDATE`, `ALTER DELETE` on
 `<db>.<table>`), never DDL, and go away with the user; the template roles of that database are not
-granted. The admin needs those privileges on `<db>.*` `WITH GRANT OPTION` ([upstream
+granted. The admin needs those privileges on `<db>.*` `WITH GRANT OPTION`, `SELECT` only on a
+read-only database, and `SELECT` on the listed columns of `system.grants` ([upstream
 setup](#upstream-setup)). Every `connect` line logs them as `tables` (`<db>.<table>:<verb>`).
 
 `GET /v1/tables?db=<db>` (or `<instance>/<db>`) with `Authorization: Bearer <token>`: the tables of a

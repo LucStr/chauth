@@ -144,10 +144,13 @@ CREATE USER chauth_admin IDENTIFIED WITH sha256_password BY 'Admin-secret-1';
 GRANT CREATE USER, DROP USER ON chauth_tmp_* TO chauth_admin;
 GRANT chauth_core_read, chauth_core_write, chauth_otel_read, chauth_otel_write, chauth_system_read, chauth_querylog_read TO chauth_admin WITH ADMIN OPTION;
 GRANT SELECT(name, valid_until) ON system.users TO chauth_admin;
--- Run tokens get table privileges directly; every database outside readOnlyDatabases needs this line.
+-- Run tokens get table privileges directly, only those the binding's role holds; every database in
+-- databases needs its line, a read-only one SELECT only.
 GRANT SELECT, INSERT, ALTER UPDATE, ALTER DELETE ON core.* TO chauth_admin WITH GRANT OPTION;
 GRANT SELECT, INSERT, ALTER UPDATE, ALTER DELETE ON otel.* TO chauth_admin WITH GRANT OPTION;
--- Row estimates of GET /v1/tables.
+GRANT SELECT ON system.* TO chauth_admin WITH GRANT OPTION;
+-- What each role holds, and the row estimates of GET /v1/tables.
+GRANT SELECT(role_name, access_type, database, table, column, is_partial_revoke) ON system.grants TO chauth_admin;
 GRANT SELECT(database, table, rows, active) ON system.parts TO chauth_admin;
 ```
 
@@ -155,11 +158,12 @@ GRANT SELECT(database, table, rows, active) ON system.parts TO chauth_admin;
   temp-user prefix (`tempUserPrefix`).
 - Every role a temp user may get must be granted to the admin `WITH ADMIN OPTION`; a role chauth
   cannot grant keeps the instance not ready.
-- `SELECT, INSERT, ALTER UPDATE, ALTER DELETE ON <db>.* WITH GRANT OPTION` for every database outside
-  `readOnlyDatabases` lets chauth grant a run token's declared tables to its temp user directly; the
-  self-test grants them too, so a missing one keeps the instance not ready
+- `SELECT, INSERT, ALTER UPDATE, ALTER DELETE ON <db>.* WITH GRANT OPTION` for every database (`SELECT`
+  only on a read-only one) lets chauth grant a run token's declared tables to its temp user directly;
+  the self-test grants them too, so a missing one keeps the instance not ready for every token
   ([authorization details](docs/config.md#authorization-details)).
-- `SELECT(database, table, rows, active) ON system.parts` gives `GET /v1/tables` its row estimates.
+- `SELECT(...) ON system.grants` lets chauth keep a run token's verbs to what the binding's role holds;
+  `SELECT(database, table, rows, active) ON system.parts` gives `GET /v1/tables` its row estimates.
 - Temp-user passwords are 32 random characters with at least two upper-case letters, lower-case
   letters, digits and characters of `!#%*+-=_` each, which meets ClickHouse Cloud's default password
   rules; a stricter `password_complexity` on a self-managed server rejects them, and readiness says so.

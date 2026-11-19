@@ -31,7 +31,7 @@ func TestEffective(t *testing.T) {
 		{"star read", Write, Write, []token.Detail{row("*", "read")}, Access{Level: Read}, "", Read},
 		{"table rows elsewhere drop named roles", Write, Write, []token.Detail{row("*", "write"), tables("otel", tbl("spans", "select"))}, Access{Level: Write}, "", None},
 		{"db override beats star", Write, Write, []token.Detail{row("*", "read"), row("core", "write")}, Access{Level: Write}, "", Read},
-		{"override narrows below star", Write, Write, []token.Detail{row("*", "write"), row("core", "read")}, Access{Level: Read}, "", Write},
+		{"override narrows below star", Write, Write, []token.Detail{row("*", "write"), row("core", "read")}, Access{Level: Read}, "", Read},
 		{"write never exceeds bindings", Read, Write, []token.Detail{row("core", "read", "write")}, Access{Level: Read}, "", None},
 		{"write never exceeds scope", Write, Read, []token.Detail{row("*", "write")}, Access{Level: Read}, "", Read},
 		{"unmatched db denied", Write, Write, []token.Detail{row("otel", "write")}, Access{}, "no row", None},
@@ -71,5 +71,35 @@ func TestEffective(t *testing.T) {
 				t.Errorf("RoleCap = %s, want %s", rc, tt.roleCap)
 			}
 		})
+	}
+}
+
+func TestCovers(t *testing.T) {
+	grants := []RoleGrant{
+		{Role: "w", Access: "SELECT", Database: "core"}, {Role: "w", Access: "INSERT", Database: "core"},
+		{Role: "w", Access: "ALTER", Database: "core"},
+		{Role: "s", Access: "SELECT", Database: "system", Table: "parts"},
+		{Role: "s", Access: "SELECT", Database: "core", Table: "items", Column: true},
+		{Role: "a", Access: "ALL"}, {Role: "a", Access: "INSERT", Database: "core", Table: "secret", PartialRevoke: true},
+		{Role: "u", Access: "ALTER UPDATE", Database: "core", Table: "items"},
+	}
+	tests := []struct {
+		role, db, table, verb string
+		want                  bool
+	}{
+		{"w", "core", "items", "select", true}, {"w", "core", "items", "insert", true},
+		{"w", "core", "items", "update", true}, {"w", "core", "items", "delete", true},
+		{"w", "otel", "spans", "select", false},
+		{"s", "system", "parts", "select", true}, {"s", "system", "query_log", "select", false},
+		{"s", "core", "items", "select", false}, // column-level only
+		{"a", "otel", "spans", "delete", true}, {"a", "core", "secret", "insert", false}, {"a", "core", "secret", "select", true},
+		{"u", "core", "items", "update", true}, {"u", "core", "items", "delete", false},
+		{"nobody", "core", "items", "select", false},
+	}
+	for _, tt := range tests {
+		g := TableGrant{Database: tt.db, Table: tt.table, Verb: tt.verb}
+		if got := Covers(grants, tt.role, g); got != tt.want {
+			t.Errorf("Covers(%s, %+v) = %v, want %v", tt.role, g, got, tt.want)
+		}
 	}
 }

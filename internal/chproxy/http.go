@@ -344,7 +344,7 @@ func (s *Server) bearer(w http.ResponseWriter, r *http.Request) (*rbac.Policy, t
 func (s *Server) reachOf(p *rbac.Policy, claims token.Claims, in chconfig.Instance) reach {
 	scopeCap := rbac.ScopeCap(claims.Scopes, s.cfg.OIDC.Scopes.Read, s.cfg.OIDC.Scopes.Write)
 	who := rbac.Who{User: claims.Username, Groups: claims.Groups, FoldUser: s.cfg.OIDC.FoldUsername()}
-	return reachOf(p, who, in, scopeCap, claims.Details)
+	return reachOf(p, who, in, scopeCap, claims.Details, s.instances[in.Name].grants())
 }
 
 func (s *Server) access(w http.ResponseWriter, r *http.Request) {
@@ -377,8 +377,8 @@ func (s *Server) access(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// tables lists the tables of one database with their row counts, from active parts, for a token
-// that reads that database whole; the admin login runs the query.
+// tables lists the tables of one database the token reaches with their row counts, from active parts,
+// only the declared ones for a token limited to tables; the admin login runs the query.
 func (s *Server) tables(w http.ResponseWriter, r *http.Request) {
 	policy, claims, ok := s.bearer(w, r)
 	if !ok {

@@ -1027,7 +1027,8 @@ func TestSetupSQLInReadme(t *testing.T) {
 // statement chauth sends for it must run, with the role and user quoted.
 func TestMixedCaseDatabase(t *testing.T) {
 	for _, stmt := range []string{"CREATE DATABASE Mixed", "CREATE TABLE Mixed.t (a UInt8) ENGINE = Memory", "INSERT INTO Mixed.t VALUES (1)",
-		"CREATE ROLE chauth_Mixed_read", "GRANT SELECT ON Mixed.* TO chauth_Mixed_read", "GRANT chauth_Mixed_read TO chauth_admin WITH ADMIN OPTION"} {
+		"CREATE ROLE chauth_Mixed_read", "GRANT SELECT ON Mixed.* TO chauth_Mixed_read", "GRANT chauth_Mixed_read TO chauth_admin WITH ADMIN OPTION",
+		"GRANT SELECT ON Mixed.* TO chauth_admin WITH GRANT OPTION"} {
 		mustRoot(t, stmt)
 	}
 	t.Cleanup(func() {

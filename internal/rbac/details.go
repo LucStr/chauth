@@ -98,20 +98,54 @@ func Effective(granted, scopeCap Level, details []token.Detail, db string) (Acce
 	return out, nil
 }
 
-// RoleCap is the cap of named-role grants: scopeCap without the claim; else at most the "*" row's
-// level, and none once any row names tables, since a named role may grant on a narrowed database.
+// RoleCap is the cap of named-role grants: scopeCap without the claim; else the lowest consent row
+// when a "*" row exists, and none without one or once any row names tables, since a named role may
+// reach any database, a narrowed one included.
 func RoleCap(scopeCap Level, details []token.Detail) Level {
 	if details == nil {
 		return scopeCap
 	}
-	lv := None
+	lv, star := scopeCap, false
 	for _, d := range details {
 		if len(d.Tables) > 0 {
 			return None
 		}
-		if d.Identifier == "*" {
-			lv = max(lv, actionsLevel(d.Actions))
-		}
+		lv = min(lv, actionsLevel(d.Actions))
+		star = star || d.Identifier == "*"
 	}
-	return min(lv, scopeCap)
+	if !star {
+		return None
+	}
+	return lv
+}
+
+// RoleGrant is one row of system.grants for an upstream role; empty Database or Table mean any.
+type RoleGrant struct {
+	Role, Access, Database, Table string
+	// Column marks a column-level grant, which never covers a whole table.
+	Column, PartialRevoke bool
+}
+
+// verbAccess are the access types that hold a verb's privilege, the privilege itself first.
+var verbAccess = map[string][]string{
+	"select": {"SELECT", "ALL"},
+	"insert": {"INSERT", "ALL"},
+	"update": {"ALTER UPDATE", "ALTER TABLE", "ALTER", "ALL"},
+	"delete": {"ALTER DELETE", "ALTER TABLE", "ALTER", "ALL"},
+}
+
+// Covers reports whether role's own grants hold verb on db.table; a partial revoke touching it, a
+// column-level grant and roles granted to role count as not holding it.
+func Covers(grants []RoleGrant, role string, g TableGrant) bool {
+	access, covered := verbAccess[g.Verb], false
+	for _, r := range grants {
+		if r.Role != role || !slices.Contains(access, r.Access) || r.Database != "" && r.Database != g.Database || r.Table != "" && r.Table != g.Table {
+			continue
+		}
+		if r.PartialRevoke {
+			return false
+		}
+		covered = covered || !r.Column
+	}
+	return covered
 }

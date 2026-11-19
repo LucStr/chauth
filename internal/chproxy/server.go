@@ -51,13 +51,17 @@ type Server struct {
 }
 
 type instance struct {
-	cfg       chconfig.Instance
-	ready     atomic.Bool
-	admin     *chusers.Admin
-	users     *chusers.Manager
-	selfTest  func(context.Context) error
-	httpURL   *url.URL
-	transport *http.Transport
+	cfg        chconfig.Instance
+	ready      atomic.Bool
+	admin      *chusers.Admin
+	users      *chusers.Manager
+	selfTest   func(context.Context) error
+	readGrants func(context.Context) error
+	// roleGrants are the template roles' own grants, read after each passing self-test; run rows
+	// keep only the verbs the binding's role holds.
+	roleGrants atomic.Pointer[[]rbac.RoleGrant]
+	httpURL    *url.URL
+	transport  *http.Transport
 }
 
 // New checks every instance's upstream settings; it connects to nothing until Start.
@@ -91,8 +95,15 @@ func New(cfg *chconfig.Config, verifier *token.Verifier, store *rbac.Store, tlsC
 				IdleTTL: time.Duration(l.TempUserIdleTTL), MaxRefs: l.MaxConnectionsPerTempUser, Log: log,
 			}),
 		}
-		roles, tables := in.GrantableRoles(), in.GrantableTables()
+		roles, tables, templates := in.GrantableRoles(), in.GrantableTables(), in.TemplateRoles()
 		inst.selfTest = func(ctx context.Context) error { return inst.users.SelfTest(ctx, roles, tables) }
+		inst.readGrants = func(ctx context.Context) error {
+			rg, err := inst.admin.RoleGrants(ctx, templates)
+			if err == nil {
+				inst.roleGrants.Store(&rg)
+			}
+			return err
+		}
 		s.instances[in.Name] = inst
 	}
 	return s, nil
@@ -131,6 +142,11 @@ func (s *Server) watch(ctx context.Context, in *instance) {
 			step, err = "self-test", in.selfTest(ctx)
 			if se := (*chusers.StepError)(nil); errors.As(err, &se) {
 				step, err = "self-test: "+se.Step, se.Err
+			}
+		}
+		if err == nil {
+			if err = in.readGrants(ctx); err != nil {
+				step = "read role grants"
 			}
 		}
 		if ctx.Err() != nil {
@@ -320,7 +336,7 @@ func (s *Server) decide(ctx context.Context, raw, target string, a *attempt) (*i
 		return nil, d, &failure{kind: denied, forbidden: true,
 			msg: fmt.Sprintf("chauth: token has neither the %s nor the %s scope", s.cfg.OIDC.Scopes.Read, s.cfg.OIDC.Scopes.Write)}
 	}
-	r := reachOf(policy, who, cfgIn, d.ScopeCap, claims.Details)
+	r := reachOf(policy, who, cfgIn, d.ScopeCap, claims.Details, in.grants())
 	d.Roles, d.Bindings, d.Level, d.Tables = cfgIn.UpstreamRoles(r.Granted), r.Bindings, r.level, r.tables
 	a.bindings, a.roles, a.level, a.tables = d.Bindings, d.Roles, d.Level.String(), tableNames(d.Tables)
 	if db != chconfig.DefaultDatabase && r.Databases[db] == rbac.None && !slices.Contains(cfgIn.Databases, db) {
@@ -346,7 +362,15 @@ type reach struct {
 	denied map[string]string
 }
 
-func reachOf(p *rbac.Policy, who rbac.Who, in chconfig.Instance, scopeCap rbac.Level, details []token.Detail) reach {
+// grants are in's role grants, nil before the first read.
+func (in *instance) grants() []rbac.RoleGrant {
+	if g := in.roleGrants.Load(); g != nil {
+		return *g
+	}
+	return nil
+}
+
+func reachOf(p *rbac.Policy, who rbac.Who, in chconfig.Instance, scopeCap rbac.Level, details []token.Detail, roleGrants []rbac.RoleGrant) reach {
 	r := reach{Granted: grants(p, who, in, scopeCap), denied: map[string]string{}}
 	roleCap := rbac.RoleCap(scopeCap, details)
 	if details != nil {
@@ -357,11 +381,13 @@ func reachOf(p *rbac.Policy, who rbac.Who, in chconfig.Instance, scopeCap rbac.L
 			case err != nil:
 				r.denied[db] = err.Error()
 				delete(r.Databases, db)
-			case acc.Tables != nil && slices.Contains(in.ReadOnlyDatabases, db):
-				r.denied[db] = "table rows grant nothing on a read-only database"
-				delete(r.Databases, db)
 			case acc.Tables != nil:
-				r.tables = append(r.tables, acc.Tables...)
+				role := in.RoleFor(db, lv)
+				held := slices.DeleteFunc(acc.Tables, func(t rbac.TableGrant) bool { return !rbac.Covers(roleGrants, role, t) })
+				if len(held) == 0 {
+					r.denied[db] = fmt.Sprintf("role %s holds none of the declared table verbs", role)
+				}
+				r.tables = append(r.tables, held...)
 				delete(r.Databases, db)
 			case acc.Level == rbac.None:
 				delete(r.Databases, db)

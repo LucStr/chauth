@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/LucStr/chauth/internal/chapi"
+	"github.com/LucStr/chauth/internal/chconfig"
 	"github.com/LucStr/chauth/internal/chtest"
 	"github.com/LucStr/chauth/internal/chwire"
 )
@@ -15,7 +16,13 @@ import (
 // TestAuthorizationDetails: consent rows narrow whole databases, run rows narrow to declared tables
 // and verbs, and ClickHouse itself refuses everything else with ACCESS_DENIED.
 func TestAuthorizationDetails(t *testing.T) {
-	h := start(t, chRole("everything", `{instance: main, database: "*", level: write}`)+binding("everything", "everything", user(chtest.User))+queryLog, nil)
+	for _, stmt := range []string{"CREATE ROLE IF NOT EXISTS chauth_core_insert", "GRANT INSERT ON core.* TO chauth_core_insert",
+		"GRANT chauth_core_insert TO chauth_admin WITH ADMIN OPTION"} {
+		mustRoot(t, stmt)
+	}
+	insertRole := chRole("ins", "{instance: main, role: chauth_core_insert, level: write}") + binding("ins", "ins", user(chtest.User))
+	h := start(t, chRole("everything", `{instance: main, database: "*", level: write}`)+binding("everything", "everything", user(chtest.User))+queryLog+insertRole,
+		func(c *chconfig.Config) { c.Instances[0].Roles = append(c.Instances[0].Roles, "chauth_core_insert") })
 	row := func(id string, kv ...any) map[string]any {
 		m := map[string]any{"type": "clickhouse", "locations": []string{chtest.Audience}, "identifier": id}
 		for i := 0; i < len(kv); i += 2 {
@@ -34,6 +41,11 @@ func TestAuthorizationDetails(t *testing.T) {
 		map[string]any{"name": "items", "verbs": []string{"insert", "select", "delete"}},
 	}))
 	consent := tok(row("*", "actions", []string{"read"}), row("core", "actions", []string{"write"}))
+	starWrite := tok(row("*", "actions", []string{"write"}), row("core", "actions", []string{"read"}))
+	sysRun := tok(row("system", "tables", []any{
+		map[string]any{"name": "parts", "verbs": []string{"select", "insert"}},
+		map[string]any{"name": "query_log", "verbs": []string{"select"}},
+	}))
 	none := tok()
 	null := shared.Issuer.Token(chtest.Claims{Scope: "clickhouse:write", Details: json.RawMessage("null")})
 	denied := int32(chwire.CodeAccessDenied)
@@ -55,6 +67,11 @@ func TestAuthorizationDetails(t *testing.T) {
 		{"consent: star is read", consent, "otel", "SELECT count() FROM otel.spans", 0},
 		{"consent: star refuses insert", consent, "otel", "INSERT INTO otel.spans VALUES (42)", denied},
 		{"consent: named role follows star", consent, "core", "SELECT count() FROM system.query_log", 0},
+		{"consent: db read beats a named write role", starWrite, "core", "INSERT INTO core.big VALUES (42)", denied},
+		{"consent: star write", starWrite, "otel", "INSERT INTO otel.spans VALUES (42)", 0},
+		{"run: select on a read-only database", sysRun, "system", "SELECT count() FROM system.parts", 0},
+		{"run: no write on a read-only database", sysRun, "system", "INSERT INTO system.parts SELECT * FROM system.parts LIMIT 0", denied},
+		{"run: only what the binding's role holds", sysRun, "system", "SELECT count() FROM system.query_log", denied},
 		{"no claim: today's access", none, "otel", "INSERT INTO otel.spans VALUES (42)", 0},
 		{"null claim refused", null, "otel", "SELECT 1", denied},
 	}
