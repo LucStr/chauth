@@ -134,18 +134,32 @@ var verbAccess = map[string][]string{
 	"delete": {"ALTER DELETE", "ALTER TABLE", "ALTER", "ALL"},
 }
 
-// Covers reports whether role's own grants hold verb on db.table; a partial revoke touching it, a
-// column-level grant and roles granted to role count as not holding it.
+// Covers reports whether role's own grants hold verb on db.table. A partial revoke of it anywhere in
+// the database counts as not holding it on every table (system.grants shows a prefix revoke such as
+// sec* as table sec), and so do column-level grants and roles granted to role.
 func Covers(grants []RoleGrant, role string, g TableGrant) bool {
 	access, covered := verbAccess[g.Verb], false
 	for _, r := range grants {
-		if r.Role != role || !slices.Contains(access, r.Access) || r.Database != "" && r.Database != g.Database || r.Table != "" && r.Table != g.Table {
+		if r.Role != role || !slices.Contains(access, r.Access) || r.Database != "" && r.Database != g.Database {
 			continue
 		}
 		if r.PartialRevoke {
 			return false
 		}
-		covered = covered || !r.Column
+		covered = covered || r.Table == "" || r.Table == g.Table && !r.Column
 	}
 	return covered
+}
+
+// Upstream is what chauth reads from an instance to bound direct table grants.
+type Upstream struct {
+	Grants []RoleGrant
+	// RowPolicyDatabases have a row policy on some table or on the whole database; a direct grant
+	// would bypass a policy aimed at the binding's role, so they get no table intent.
+	RowPolicyDatabases []string
+}
+
+// Holds reports whether a direct grant of g stays within what role reaches; nil u holds nothing.
+func (u *Upstream) Holds(role string, g TableGrant) bool {
+	return u != nil && !slices.Contains(u.RowPolicyDatabases, g.Database) && Covers(u.Grants, role, g)
 }

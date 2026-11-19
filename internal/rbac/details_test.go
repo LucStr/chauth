@@ -82,6 +82,8 @@ func TestCovers(t *testing.T) {
 		{Role: "s", Access: "SELECT", Database: "core", Table: "items", Column: true},
 		{Role: "a", Access: "ALL"}, {Role: "a", Access: "INSERT", Database: "core", Table: "secret", PartialRevoke: true},
 		{Role: "u", Access: "ALTER UPDATE", Database: "core", Table: "items"},
+		{Role: "p", Access: "SELECT", Database: "rev"}, {Role: "p", Access: "INSERT", Database: "rev"},
+		{Role: "p", Access: "SELECT", Database: "rev", Table: "sec", PartialRevoke: true},
 	}
 	tests := []struct {
 		role, db, table, verb string
@@ -94,6 +96,8 @@ func TestCovers(t *testing.T) {
 		{"s", "core", "items", "select", false}, // column-level only
 		{"a", "otel", "spans", "delete", true}, {"a", "core", "secret", "insert", false}, {"a", "core", "secret", "select", true},
 		{"u", "core", "items", "update", true}, {"u", "core", "items", "delete", false},
+		{"a", "core", "other", "insert", false}, // a revoke anywhere in the database
+		{"p", "rev", "secret", "select", false}, {"p", "rev", "open", "select", false}, {"p", "rev", "open", "insert", true},
 		{"nobody", "core", "items", "select", false},
 	}
 	for _, tt := range tests {

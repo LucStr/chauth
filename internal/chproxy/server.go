@@ -57,11 +57,12 @@ type instance struct {
 	users      *chusers.Manager
 	selfTest   func(context.Context) error
 	readGrants func(context.Context) error
-	// roleGrants are the template roles' own grants, read after each passing self-test; run rows
+	// upstream holds the template roles' own grants and the row-policy databases, read after each
+	// passing self-test; run rows
 	// keep only the verbs the binding's role holds.
-	roleGrants atomic.Pointer[[]rbac.RoleGrant]
-	httpURL    *url.URL
-	transport  *http.Transport
+	upstream  atomic.Pointer[rbac.Upstream]
+	httpURL   *url.URL
+	transport *http.Transport
 }
 
 // New checks every instance's upstream settings; it connects to nothing until Start.
@@ -98,9 +99,9 @@ func New(cfg *chconfig.Config, verifier *token.Verifier, store *rbac.Store, tlsC
 		roles, tables, templates := in.GrantableRoles(), in.GrantableTables(), in.TemplateRoles()
 		inst.selfTest = func(ctx context.Context) error { return inst.users.SelfTest(ctx, roles, tables) }
 		inst.readGrants = func(ctx context.Context) error {
-			rg, err := inst.admin.RoleGrants(ctx, templates)
+			u, err := inst.admin.Upstream(ctx, templates)
 			if err == nil {
-				inst.roleGrants.Store(&rg)
+				inst.upstream.Store(u)
 			}
 			return err
 		}
@@ -362,15 +363,11 @@ type reach struct {
 	denied map[string]string
 }
 
-// grants are in's role grants, nil before the first read.
-func (in *instance) grants() []rbac.RoleGrant {
-	if g := in.roleGrants.Load(); g != nil {
-		return *g
-	}
-	return nil
-}
+// grants are in's upstream grants and row policies, nil before the first read.
+func (in *instance) grants() *rbac.Upstream { return in.upstream.Load() }
 
-func reachOf(p *rbac.Policy, who rbac.Who, in chconfig.Instance, scopeCap rbac.Level, details []token.Detail, roleGrants []rbac.RoleGrant) reach {
+func reachOf(p *rbac.Policy, who rbac.Who, in chconfig.Instance, scopeCap rbac.Level, details []token.Detail, upstream *rbac.Upstream) reach {
+	// Bindings stay as the rules gave them, before authorization_details removed any database.
 	r := reach{Granted: grants(p, who, in, scopeCap), denied: map[string]string{}}
 	roleCap := rbac.RoleCap(scopeCap, details)
 	if details != nil {
@@ -383,9 +380,9 @@ func reachOf(p *rbac.Policy, who rbac.Who, in chconfig.Instance, scopeCap rbac.L
 				delete(r.Databases, db)
 			case acc.Tables != nil:
 				role := in.RoleFor(db, lv)
-				held := slices.DeleteFunc(acc.Tables, func(t rbac.TableGrant) bool { return !rbac.Covers(roleGrants, role, t) })
+				held := slices.DeleteFunc(acc.Tables, func(t rbac.TableGrant) bool { return !upstream.Holds(role, t) })
 				if len(held) == 0 {
-					r.denied[db] = fmt.Sprintf("role %s holds none of the declared table verbs", role)
+					r.denied[db] = fmt.Sprintf("role %s holds none of the declared table verbs, or the database has a row policy", role)
 				}
 				r.tables = append(r.tables, held...)
 				delete(r.Databases, db)

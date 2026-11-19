@@ -16,13 +16,33 @@ import (
 // TestAuthorizationDetails: consent rows narrow whole databases, run rows narrow to declared tables
 // and verbs, and ClickHouse itself refuses everything else with ACCESS_DENIED.
 func TestAuthorizationDetails(t *testing.T) {
-	for _, stmt := range []string{"CREATE ROLE IF NOT EXISTS chauth_core_insert", "GRANT INSERT ON core.* TO chauth_core_insert",
-		"GRANT chauth_core_insert TO chauth_admin WITH ADMIN OPTION"} {
+	setup := []string{"CREATE ROLE IF NOT EXISTS chauth_core_insert", "GRANT INSERT ON core.* TO chauth_core_insert",
+		"GRANT chauth_core_insert TO chauth_admin WITH ADMIN OPTION"}
+	// rev: the write role has a prefix revoke; pol: a table has a row policy.
+	for _, db := range []string{"rev", "pol"} {
+		setup = append(setup, "CREATE DATABASE "+db, "CREATE TABLE "+db+".secret (id UInt8) ENGINE = Memory", "INSERT INTO "+db+".secret VALUES (1), (2)",
+			"CREATE ROLE chauth_"+db+"_read", "GRANT SELECT ON "+db+".* TO chauth_"+db+"_read",
+			"CREATE ROLE chauth_"+db+"_write", "GRANT SELECT, INSERT ON "+db+".* TO chauth_"+db+"_write",
+			"GRANT chauth_"+db+"_read, chauth_"+db+"_write TO chauth_admin WITH ADMIN OPTION",
+			"GRANT SELECT, INSERT, ALTER UPDATE, ALTER DELETE ON "+db+".* TO chauth_admin WITH GRANT OPTION")
+	}
+	setup = append(setup, "REVOKE SELECT ON rev.sec* FROM chauth_rev_write",
+		"CREATE ROW POLICY chauth_test_pol ON pol.secret AS restrictive FOR SELECT USING id = 1 TO chauth_pol_write")
+	for _, stmt := range setup {
 		mustRoot(t, stmt)
 	}
+	t.Cleanup(func() {
+		for _, stmt := range []string{"DROP ROW POLICY IF EXISTS chauth_test_pol ON pol.secret", "DROP DATABASE IF EXISTS rev", "DROP DATABASE IF EXISTS pol",
+			"DROP ROLE IF EXISTS chauth_rev_read, chauth_rev_write, chauth_pol_read, chauth_pol_write"} {
+			mustRoot(t, stmt)
+		}
+	})
 	insertRole := chRole("ins", "{instance: main, role: chauth_core_insert, level: write}") + binding("ins", "ins", user(chtest.User))
 	h := start(t, chRole("everything", `{instance: main, database: "*", level: write}`)+binding("everything", "everything", user(chtest.User))+queryLog+insertRole,
-		func(c *chconfig.Config) { c.Instances[0].Roles = append(c.Instances[0].Roles, "chauth_core_insert") })
+		func(c *chconfig.Config) {
+			c.Instances[0].Roles = append(c.Instances[0].Roles, "chauth_core_insert")
+			c.Instances[0].Databases = append(c.Instances[0].Databases, "rev", "pol")
+		})
 	row := func(id string, kv ...any) map[string]any {
 		m := map[string]any{"type": "clickhouse", "locations": []string{chtest.Audience}, "identifier": id}
 		for i := 0; i < len(kv); i += 2 {
@@ -46,6 +66,9 @@ func TestAuthorizationDetails(t *testing.T) {
 		map[string]any{"name": "parts", "verbs": []string{"select", "insert"}},
 		map[string]any{"name": "query_log", "verbs": []string{"select"}},
 	}))
+	secretRun := func(db string) string {
+		return tok(row(db, "tables", []any{map[string]any{"name": "secret", "verbs": []string{"select", "insert"}}}))
+	}
 	none := tok()
 	null := shared.Issuer.Token(chtest.Claims{Scope: "clickhouse:write", Details: json.RawMessage("null")})
 	denied := int32(chwire.CodeAccessDenied)
@@ -72,6 +95,9 @@ func TestAuthorizationDetails(t *testing.T) {
 		{"run: select on a read-only database", sysRun, "system", "SELECT count() FROM system.parts", 0},
 		{"run: no write on a read-only database", sysRun, "system", "INSERT INTO system.parts SELECT * FROM system.parts LIMIT 0", denied},
 		{"run: only what the binding's role holds", sysRun, "system", "SELECT count() FROM system.query_log", denied},
+		{"run: prefix revoke on the role refuses the database", secretRun("rev"), "rev", "SELECT count() FROM rev.secret", denied},
+		{"run: row policy refuses the database", secretRun("pol"), "pol", "SELECT count() FROM pol.secret", denied},
+		{"no claim: row policy applies", none, "pol", "SELECT count() FROM pol.secret HAVING count() = 1", 0},
 		{"no claim: today's access", none, "otel", "INSERT INTO otel.spans VALUES (42)", 0},
 		{"null claim refused", null, "otel", "SELECT 1", denied},
 	}
