@@ -37,15 +37,17 @@ func TestParseDetails(t *testing.T) {
 		{"unknown verb", `[{"type":"clickhouse","locations":["` + aud + `"],"identifier":"core","tables":[{"name":"items","verbs":["drop"]}]}]`, nil, "unknown verb"},
 		{"no verbs", `[{"type":"clickhouse","locations":["` + aud + `"],"identifier":"core","tables":[{"name":"items","verbs":[]}]}]`, nil, "no verbs"},
 		{"not an array", `{"type":"clickhouse"}`, nil, "must be an array"},
-		{"array of non-objects", `[1]`, nil, "not an array of known rows"},
+		{"array of non-objects", `[1]`, nil, "must be an object"},
+		{"long-s field", `[{"type":"clickhouse","locations":["` + aud + `"],"identifier":"*","actions":["read"],"actionſ":["write"]}]`, nil, "unknown field"},
+		{"capitalised field", `[{"type":"clickhouse","locations":["` + aud + `"],"identifier":"*","Actions":["write"]}]`, nil, "unknown field"},
+		{"duplicate field", `[{"type":"clickhouse","locations":["` + aud + `"],"identifier":"*","actions":["read"],"actions":["write"]}]`, nil, "duplicate field"},
+		{"capitalised table field", `[{"type":"clickhouse","locations":["` + aud + `"],"identifier":"core","tables":[{"name":"items","Verbs":["delete"]}]}]`, nil, "unknown field"},
+		{"duplicate table field", `[{"type":"clickhouse","locations":["` + aud + `"],"identifier":"core","tables":[{"name":"items","verbs":["select"],"verbs":["delete"]}]}]`, nil, "duplicate field"},
+		{"tables not an array", `[{"type":"clickhouse","locations":["` + aud + `"],"identifier":"core","tables":{"name":"items"}}]`, nil, "tables must be an array"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var raw any
-			if err := json.Unmarshal([]byte(tt.claim), &raw); err != nil {
-				t.Fatal(err)
-			}
-			got, err := ParseDetails(raw, DetailsType, aud)
+			got, err := ParseDetails(json.RawMessage(tt.claim), DetailsType, aud)
 			if tt.err != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.err) {
 					t.Fatalf("err = %v, want %q", err, tt.err)

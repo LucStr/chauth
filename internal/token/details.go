@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
 	"unicode"
@@ -36,17 +37,31 @@ var (
 	verbs   = []string{"select", "insert", "update", "delete"}
 )
 
-// ParseDetails reads the value of a present claim: the rows of type typ, possibly none. Rows of
+// ParseDetails reads the JSON value of a present claim: the rows of type typ, possibly none. Rows of
 // another type are skipped; null, a non-array, or anything unknown or malformed fails.
-func ParseDetails(raw any, typ, audience string) ([]Detail, error) {
-	if _, ok := raw.([]any); !ok {
+func ParseDetails(raw json.RawMessage, typ, audience string) ([]Detail, error) {
+	var items []json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil || items == nil {
 		return nil, errors.New("must be an array")
 	}
-	b, err := json.Marshal(raw)
-	if err != nil {
-		return nil, err
+	for i, item := range items {
+		row, err := exactFields(item, "type", "locations", "identifier", "actions", "tables")
+		if err != nil {
+			return nil, fmt.Errorf("row %d: %w", i, err)
+		}
+		if t, ok := row["tables"]; ok {
+			var rules []json.RawMessage
+			if err := json.Unmarshal(t, &rules); err != nil {
+				return nil, fmt.Errorf("row %d: tables must be an array", i)
+			}
+			for _, r := range rules {
+				if _, err := exactFields(r, "name", "verbs"); err != nil {
+					return nil, fmt.Errorf("row %d: table: %w", i, err)
+				}
+			}
+		}
 	}
-	dec := json.NewDecoder(bytes.NewReader(b))
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	var all []Detail
 	if err := dec.Decode(&all); err != nil {
@@ -101,4 +116,57 @@ func checkDetail(d Detail, audience string) error {
 
 func printable(s string) bool {
 	return !strings.ContainsFunc(s, func(r rune) bool { return r == unicode.ReplacementChar || unicode.IsControl(r) })
+}
+
+// exactFields reads one JSON object whose keys must each be one of allowed, spelled exactly, and
+// appear once: encoding/json matches keys ignoring case (Unicode folding) and lets the last duplicate win.
+func exactFields(b []byte, allowed ...string) (map[string]json.RawMessage, error) {
+	fields, err := ObjectFields(b)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]json.RawMessage{}
+	for _, f := range fields {
+		if !slices.Contains(allowed, f.Key) {
+			return nil, fmt.Errorf("unknown field %q", f.Key)
+		}
+		if _, dup := out[f.Key]; dup {
+			return nil, fmt.Errorf("duplicate field %q", f.Key)
+		}
+		out[f.Key] = f.Value
+	}
+	return out, nil
+}
+
+// Field is one member of a JSON object, in the order written.
+type Field struct {
+	Key   string
+	Value json.RawMessage
+}
+
+// ObjectFields lists the members of the JSON object b, duplicates included.
+func ObjectFields(b []byte) ([]Field, error) {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+		return nil, errors.New("must be an object")
+	}
+	var out []Field
+	for dec.More() {
+		t, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		f := Field{Key: t.(string)}
+		if err := dec.Decode(&f.Value); err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	if _, err := dec.Token(); err != nil {
+		return nil, err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, errors.New("trailing data after the object")
+	}
+	return out, nil
 }

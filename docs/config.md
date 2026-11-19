@@ -179,7 +179,8 @@ token without it gets exactly what the bindings and the scope cap give. Each row
 | `actions` | consent row: `read` or `write` (write includes read), the whole database at most at that level |
 | `tables` | run row: `[{name, verbs}]`, the bare table name and any of `select`, `insert`, `update`, `delete`; a database with run rows reaches only those tables |
 
-A present claim that is `null` or not an array, a row with an unknown field, both or neither of
+A present claim that is `null` or not an array, a claim or field name not spelled exactly or given
+twice, a row with an unknown field, both or neither of
 `actions` and `tables`, `tables` on `*`, or a location other than the audience refuses the token
 (497, or 401 on `/v1/access`); only an absent claim means no claim.
 
