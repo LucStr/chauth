@@ -112,14 +112,15 @@ is ready. An instance is ready after the admin login works, a first sweep ran an
 serve creates `<tempUserPrefix>_selftest_<pod><random>` (no person's temp user starts with `<tempUserPrefix>_`) with the same statement real temp users get
 (generated password, a `VALID UNTIL` minutes ahead, `tempUserHostIPs`, `log_comment` and
 `readonly = 2` as `CONST`), grants it in one statement every role the instance can hand out (each
-database's roles at both levels after `readOnlyDatabases`, plus `roles`), logs in as it the way a new
+database's roles at both levels after `readOnlyDatabases`, plus `roles`), then in a second statement
+the four table privileges on every database outside `readOnlyDatabases`, logs in as it the way a new
 temp user is first logged in, and drops it. Until it passes, retried with backoff up to 5 s, the
 instance refuses connections with 210 / 503. It repeats every `limits.selfTestInterval`. Once ready,
 an instance turns not ready only after 3 failed checks in a row, retried 1 s apart, and then retries
 with backoff up to 5 s; one passing check makes it ready again at once, and open connections and
 running queries are never touched. Each change logs once: `instance ready` with the roles, or
 `instance not ready` with `failures` and the last failure's `step` (`admin login`, `sweep`, `self-test: create temp user`,
-`self-test: grant roles to temp user`, `self-test: first login of temp user`, `self-test: drop temp
+`self-test: grant roles to temp user`, `self-test: grant tables to temp user`, `self-test: first login of temp user`, `self-test: drop temp
 user`) and ClickHouse's `error`. A login failure (516) means the password, the `HOST IP` or a replica
 the user has not reached within 10 s. The metrics `chauth.selftest.ok` (1 or 0) and
 `chauth.selftest.time` (Unix seconds) per `chauth.instance` hold the last result, and
@@ -129,7 +130,7 @@ is never handed out; one left by a crash expires and the sweep drops it.
 
 ## Discovery and access
 
-serve's HTTPS port answers three requests of its own; every other path is proxied to ClickHouse.
+serve's HTTPS port answers four requests of its own; every other path is proxied to ClickHouse.
 `GET /ping` answers `Ok.` without a token.
 
 `GET /.well-known/chauth`, no authentication: what a connector needs to log in and to list targets.
@@ -153,9 +154,49 @@ and the read-only cap, one entry per instance with anything reachable (`[]` when
   "roles": ["chauth_querylog_read"]}]
 ```
 
-`level` is the temp user's level on that instance: `write` when any database or named role is
+A database reached through [authorization details](#authorization-details) tables lists them as
+`"tables": [{"table": "items", "verb": "insert"}]`. `level` is the temp user's level on that instance: `write` when any database or named role is
 reached at write, else `read` (the temp user then has `readonly = 2`). `chauth ls` prints these
 entries as a database table followed by the named roles. The types are `internal/chapi`.
+
+## Authorization details
+
+A token may carry the `authorization_details` claim (RFC 9396) to narrow what its bindings give. A
+token without it gets exactly what the bindings and the scope cap give. Each row:
+
+```json
+[{"type": "clickhouse", "locations": ["https://clickhouse.example.com"], "identifier": "*", "actions": ["read"]},
+ {"type": "clickhouse", "locations": ["https://clickhouse.example.com"], "identifier": "core", "actions": ["write"]},
+ {"type": "clickhouse", "locations": ["https://clickhouse.example.com"], "identifier": "core",
+  "tables": [{"name": "items", "verbs": ["insert", "select"]}]}]
+```
+
+| Field | Rule |
+| --- | --- |
+| `type` | rows of another type are skipped |
+| `locations` | exactly one, equal to `oidc.audience` |
+| `identifier` | `*` or a database name (on every instance that serves it); the database's own rows win over `*` |
+| `actions` | `read` or `write` (write includes read): the whole database at that level |
+| `tables` | `[{name, verbs}]`, the bare table name and any of `select`, `insert`, `update`, `delete`; a database with table rows reaches only those tables, and table rows win over `actions` rows |
+
+A row with an unknown field, both or neither of `actions` and `tables`, `tables` on `*`, or a
+location other than the audience refuses the token (497, or 401 on `/v1/access`). Every row only
+narrows: the level is at most the binding's after the scope cap, a verb beyond it is dropped, and a
+database without a row is not reached. Named roles (`instances[].roles`) follow the `*` row's level
+and are dropped without one. Table rows on a read-only database give nothing.
+
+Tables are granted to the temp user directly (`SELECT`, `INSERT`, `ALTER UPDATE`, `ALTER DELETE` on
+`<db>.<table>`), never DDL, and go away with the user; the template roles of that database are not
+granted. The admin needs those privileges on `<db>.*` `WITH GRANT OPTION` ([upstream
+setup](#upstream-setup)). Every `connect` line logs them as `tables` (`<db>.<table>:<verb>`).
+
+`GET /v1/tables?db=<db>` (or `<instance>/<db>`) with `Authorization: Bearer <token>`: the tables of a
+database the token reads whole, with the rows of their active parts. 403 when the token does not
+read the database whole (a token limited to tables included), 400 for an unknown database.
+
+```json
+[{"schema": "core", "table": "items", "estimatedRows": 48000}]
+```
 
 ## Errors
 

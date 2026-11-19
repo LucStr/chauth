@@ -28,6 +28,14 @@ _Avoid_: custom role, direct grant
 A `ChRole` chauth provides without YAML: `<instance>.<db>.read|write` for every configured database. There is no admin or reader role.
 _Avoid_: default role, system role
 
+**Authorization details**:
+The token's `authorization_details` rows that narrow what its bindings give: consent rows per database (read or write) and run rows naming tables and verbs.
+_Avoid_: token grants, permissions claim
+
+**Table grant**:
+One verb (select, insert, update, delete) on one table, granted to a temp user directly from a run row; never DDL.
+_Avoid_: table role
+
 **Role binding**:
 A `ChRoleBinding` that gives one `ChRole`'s grants to users and groups named in the token.
 _Avoid_: assignment, membership

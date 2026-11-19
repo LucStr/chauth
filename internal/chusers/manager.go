@@ -37,13 +37,36 @@ type Key struct {
 	Level rbac.Level
 	// Roles are the upstream roles the user is granted.
 	Roles []string
+	// Tables are privileges granted to the user directly; an empty Table means the whole database.
+	Tables []rbac.TableGrant
 }
 
 func (k Key) id() string {
 	roles := slices.Clone(k.Roles)
 	slices.Sort(roles)
-	h := sha256.Sum256([]byte(k.Subject + "\x00" + k.Email + "\x00" + k.Level.String() + "\x00" + strings.Join(roles, ",")))
+	var b strings.Builder
+	b.WriteString(k.Subject + "\x00" + k.Email + "\x00" + k.Level.String() + "\x00" + strings.Join(roles, ","))
+	for _, t := range k.Tables {
+		b.WriteString("\x00" + t.Database + "\x01" + t.Table + "\x01" + t.Verb)
+	}
+	h := sha256.Sum256([]byte(b.String()))
 	return hex.EncodeToString(h[:])
+}
+
+// grantTables is one GRANT statement for every table privilege of k, or "" without any.
+func grantTables(k Key, user string) string {
+	parts := make([]string, len(k.Tables))
+	for i, t := range k.Tables {
+		on := Ident(t.Database) + ".*"
+		if t.Table != "" {
+			on = Ident(t.Database) + "." + Ident(t.Table)
+		}
+		parts[i] = t.Privilege() + " ON " + on
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "GRANT " + strings.Join(parts, ", ") + " TO " + Ident(user)
 }
 
 // Options are the lifetimes from the serve config's limits.
@@ -272,15 +295,25 @@ func (m *Manager) create(ctx context.Context, e *entry, k Key) error {
 		m.created.Add(ctx, 1)
 		m.live.Add(ctx, 1)
 	}
-	quoted := make([]string, len(k.Roles))
-	for i, r := range k.Roles {
-		quoted[i] = Ident(r)
+	var err error
+	if len(k.Roles) > 0 {
+		quoted := make([]string, len(k.Roles))
+		for i, r := range k.Roles {
+			quoted[i] = Ident(r)
+		}
+		if err = m.admin.Exec(ctx, "GRANT "+strings.Join(quoted, ", ")+" TO "+Ident(e.name)); err != nil {
+			err = &StepError{Step: "grant roles to temp user", Err: err}
+		}
 	}
-	err := m.admin.Exec(ctx, "GRANT "+strings.Join(quoted, ", ")+" TO "+Ident(e.name))
-	if err != nil {
-		err = &StepError{Step: "grant roles to temp user", Err: err}
-	} else if err = m.probe(ctx, e); err != nil {
-		err = &StepError{Step: "first login of temp user", Err: err}
+	if stmt := grantTables(k, e.name); err == nil && stmt != "" {
+		if err = m.admin.Exec(ctx, stmt); err != nil {
+			err = &StepError{Step: "grant tables to temp user", Err: err}
+		}
+	}
+	if err == nil {
+		if err = m.probe(ctx, e); err != nil {
+			err = &StepError{Step: "first login of temp user", Err: err}
+		}
 	}
 	if err != nil {
 		_ = m.dropEntry(context.WithoutCancel(ctx), e)
@@ -343,10 +376,10 @@ type StepError struct {
 func (e *StepError) Error() string { return e.Step + ": " + e.Err.Error() }
 func (e *StepError) Unwrap() error { return e.Err }
 
-// SelfTest creates a temp user the way Acquire does, with roles, logs in as it and drops it. The user
-// is never handed out; one left by a crash expires within minutes and the sweep drops it.
-func (m *Manager) SelfTest(ctx context.Context, roles []string) error {
-	k := Key{Subject: "selftest", Email: "chauth self-test", Level: rbac.Read, Roles: roles}
+// SelfTest creates a temp user the way Acquire does, with roles and tables, logs in as it and drops
+// it. The user is never handed out; one left by a crash expires within minutes and the sweep drops it.
+func (m *Manager) SelfTest(ctx context.Context, roles []string, tables []rbac.TableGrant) error {
+	k := Key{Subject: "selftest", Email: "chauth self-test", Level: rbac.Read, Roles: roles, Tables: tables}
 	err := checkKey(k)
 	if err == nil {
 		e := &entry{name: m.selfTestName(), password: m.opts.Password(), selfTest: true}
@@ -477,8 +510,13 @@ func checkKey(k Key) error {
 	if !utf8.ValidString(k.Email) || strings.ContainsFunc(k.Email, unicode.IsControl) {
 		return fmt.Errorf("%w: email contains control characters", ErrBadKey)
 	}
-	if len(k.Roles) == 0 {
-		return fmt.Errorf("%w: no roles", ErrBadKey)
+	if len(k.Roles) == 0 && len(k.Tables) == 0 {
+		return fmt.Errorf("%w: no roles and no tables", ErrBadKey)
+	}
+	for _, t := range k.Tables {
+		if t.Database == "" || t.Privilege() == "" {
+			return fmt.Errorf("%w: table grant %+v", ErrBadKey, t)
+		}
 	}
 	for _, r := range k.Roles {
 		if !rbac.ValidUpstreamRole(r) {

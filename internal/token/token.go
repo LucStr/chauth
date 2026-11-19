@@ -29,6 +29,8 @@ type Claims struct {
 	Groups []string
 	Scopes []string
 	Expiry time.Time
+	// Details are the authorization_details rows for chauth; nil when the token has no such claim.
+	Details []Detail
 }
 
 type Verifier struct {
@@ -245,6 +247,9 @@ func (v *Verifier) Verify(ctx context.Context, raw string) (Claims, error) {
 	}
 	if c.Scopes, err = stringList(scope, true); err != nil {
 		return Claims{}, fmt.Errorf("%w: claim scope: %v", ErrDenied, err)
+	}
+	if c.Details, err = ParseDetails(all[DetailsClaim], DetailsType, v.cfg.Audience); err != nil {
+		return Claims{}, fmt.Errorf("%w: claim %s: %v", ErrDenied, DetailsClaim, err)
 	}
 	return c, nil
 }

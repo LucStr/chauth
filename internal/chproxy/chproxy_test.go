@@ -1674,10 +1674,10 @@ func TestSelfTestMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer lease.Release()
-	if err := m.SelfTest(ctx, []string{"chauth_core_read"}); err != nil {
+	if err := m.SelfTest(ctx, []string{"chauth_core_read"}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := weak.SelfTest(ctx, []string{"chauth_core_read"}); err == nil {
+	if err := weak.SelfTest(ctx, []string{"chauth_core_read"}, nil); err == nil {
 		t.Fatal("self-test with a weak password passed")
 	}
 	var rm metricdata.ResourceMetrics

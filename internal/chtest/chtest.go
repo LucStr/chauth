@@ -194,6 +194,8 @@ type Claims struct {
 	Expired                       bool
 	// Alg is RS256 (default) or ES256; Kid overrides the key's own id.
 	Alg, Kid string
+	// Details, when set, is the authorization_details claim.
+	Details any
 }
 
 // Issuer is an OIDC issuer with one RSA and one EC signing key.
@@ -260,10 +262,14 @@ func (is *Issuer) Token(c Claims) string {
 	if c.Expired {
 		exp = time.Now().Add(-time.Minute)
 	}
-	raw, err := jwt.Signed(signer).Claims(map[string]any{
+	claims := map[string]any{
 		"iss": is.srv.URL, "sub": Subject, "aud": c.Audience, "client_id": c.Client,
 		"exp": exp.Unix(), "iat": time.Now().Add(-time.Hour).Unix(), "email": c.User, "groups": c.Groups, "scope": c.Scope,
-	}).Serialize()
+	}
+	if c.Details != nil {
+		claims["authorization_details"] = c.Details
+	}
+	raw, err := jwt.Signed(signer).Claims(claims).Serialize()
 	if err != nil {
 		panic(err)
 	}

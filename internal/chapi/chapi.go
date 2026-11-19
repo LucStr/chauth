@@ -16,6 +16,8 @@ const (
 	DiscoveryPath = "/.well-known/chauth"
 	// AccessPath answers []Access for the Bearer token.
 	AccessPath = "/v1/access"
+	// TablesPath answers []Table for the database in its db parameter, for a token that reads it whole.
+	TablesPath = "/v1/tables"
 )
 
 // Discovery is the body of GET DiscoveryPath.
@@ -50,12 +52,26 @@ type Access struct {
 	Roles     []string         `json:"roles"`
 }
 
+// DatabaseAccess is one database the token reaches. With Tables, only those tables and verbs.
 type DatabaseAccess struct {
-	Database string `json:"database"`
-	Level    string `json:"level"`
+	Database string        `json:"database"`
+	Level    string        `json:"level"`
+	Tables   []TableAccess `json:"tables,omitempty"`
 }
 
-// Error is the body of every non-200 answer of the two endpoints.
+type TableAccess struct {
+	Table string `json:"table"`
+	Verb  string `json:"verb"`
+}
+
+// Table is one table of the body of GET TablesPath; Schema is the database.
+type Table struct {
+	Schema        string `json:"schema"`
+	Table         string `json:"table"`
+	EstimatedRows uint64 `json:"estimatedRows"`
+}
+
+// Error is the body of every non-200 answer of the access and tables endpoints.
 type Error struct {
 	Error string `json:"error"`
 }

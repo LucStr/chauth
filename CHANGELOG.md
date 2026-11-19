@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- Tokens may carry `authorization_details` (RFC 9396, type `clickhouse`): consent rows narrow each
+  database to read or write, run rows narrow a database to declared tables and verbs, granted to the
+  temp user directly as `SELECT`, `INSERT`, `ALTER UPDATE`, `ALTER DELETE` and never DDL. Rows only
+  narrow the bindings; unknown fields refuse the token; a token without the claim is unchanged.
+  `/v1/access` shows the tables, and `connect` lines log them as `tables`.
+- `GET /v1/tables?db=<db>`: the tables of a database the token reads, with row estimates from active
+  parts.
+
+Upgrading: the admin needs `SELECT, INSERT, ALTER UPDATE, ALTER DELETE ON <db>.* WITH GRANT OPTION`
+for every database outside `readOnlyDatabases`, and `SELECT(database, table, rows, active) ON
+system.parts`. The self-test grants the table privileges, so without them the instance never becomes
+ready and the log names the step `self-test: grant tables to temp user`.
+
 ## v0.1.1 (2026-11-17)
 
 - Fix: temp-user passwords had only lower-case letters and digits, so a server with password
