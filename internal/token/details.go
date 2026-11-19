@@ -36,11 +36,11 @@ var (
 	verbs   = []string{"select", "insert", "update", "delete"}
 )
 
-// ParseDetails reads the claim value raw: nil when the token has no claim, else the rows of type typ,
-// possibly none. Rows of another type are skipped; anything unknown or malformed fails.
+// ParseDetails reads the value of a present claim: the rows of type typ, possibly none. Rows of
+// another type are skipped; null, a non-array, or anything unknown or malformed fails.
 func ParseDetails(raw any, typ, audience string) ([]Detail, error) {
-	if raw == nil {
-		return nil, nil
+	if _, ok := raw.([]any); !ok {
+		return nil, errors.New("must be an array")
 	}
 	b, err := json.Marshal(raw)
 	if err != nil {

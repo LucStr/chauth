@@ -2,7 +2,9 @@ package chproxy
 
 import (
 	"context"
+	"encoding/json"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/LucStr/chauth/internal/chapi"
@@ -33,6 +35,7 @@ func TestAuthorizationDetails(t *testing.T) {
 	}))
 	consent := tok(row("*", "actions", []string{"read"}), row("core", "actions", []string{"write"}))
 	none := tok()
+	null := shared.Issuer.Token(chtest.Claims{Scope: "clickhouse:write", Details: json.RawMessage("null")})
 	denied := int32(chwire.CodeAccessDenied)
 	tests := []struct {
 		name, tok, db, stmt string
@@ -53,6 +56,7 @@ func TestAuthorizationDetails(t *testing.T) {
 		{"consent: star refuses insert", consent, "otel", "INSERT INTO otel.spans VALUES (42)", denied},
 		{"consent: named role follows star", consent, "core", "SELECT count() FROM system.query_log", 0},
 		{"no claim: today's access", none, "otel", "INSERT INTO otel.spans VALUES (42)", 0},
+		{"null claim refused", null, "otel", "SELECT 1", denied},
 	}
 	ctx := context.Background()
 	for _, tt := range tests {
@@ -80,17 +84,23 @@ func TestAuthorizationDetails(t *testing.T) {
 	for _, tt := range []struct {
 		tok, db string
 		status  int
+		tables  []string // nil: skip the check
 	}{
-		{consent, "core", 200}, {consent, "otel", 200}, {none, "main/core", 200},
-		{run, "core", 403}, {run, "otel", 403}, {consent, "nope", 400}, {"", "core", 401},
+		{consent, "core", 200, []string{"big", "items"}}, {consent, "otel", 200, []string{"spans"}}, {none, "main/core", 200, []string{"big", "items"}},
+		{run, "core", 200, []string{"items"}}, {run, "otel", 403, nil},
+		{consent, "nope", 404, nil}, {consent, "", 404, nil}, {consent, "main/nope", 404, nil}, {"", "core", 401, nil},
 	} {
 		var rows []chapi.Table
 		status := getJSON(t, h.url+chapi.TablesPath+"?db="+tt.db, tt.tok, &rows)
-		if status != tt.status {
-			t.Errorf("tables %s: %d, want %d", tt.db, status, tt.status)
+		var names []string
+		for _, r := range rows {
+			names = append(names, r.Table)
+			if r.Table == "big" && r.EstimatedRows < 4000000 {
+				t.Errorf("tables %s: %+v", tt.db, r)
+			}
 		}
-		if status == 200 && tt.db != "otel" && (len(rows) != 2 || rows[0] != chapi.Table{Schema: "core", Table: "big", EstimatedRows: rows[0].EstimatedRows} || rows[0].EstimatedRows < 4000000) {
-			t.Errorf("tables %s: %+v", tt.db, rows)
+		if status != tt.status || tt.tables != nil && strings.Join(names, ",") != strings.Join(tt.tables, ",") {
+			t.Errorf("tables %q: %d %v, want %d %v", tt.db, status, names, tt.status, tt.tables)
 		}
 	}
 }

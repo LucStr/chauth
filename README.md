@@ -88,7 +88,7 @@ instance passed a self-test: create a temp user with every role chauth can grant
 ([readiness](docs/config.md#readiness)). On the HTTPS port, `GET /.well-known/chauth` publishes the
 addresses, issuer, audience, scopes and instances for connectors, `GET /v1/access` with a bearer
 token lists what that token reaches, `GET /v1/tables?db=<db>` lists a database's tables with row
-estimates for a token that reads it, and `GET /ping` answers `Ok.` without a token
+estimates for a token that reaches it, and `GET /ping` answers `Ok.` without a token
 ([shapes](docs/config.md#discovery-and-access)). Every native connection logs a `connect` line when
 it is decided and a `disconnect` line with its duration and bytes when it closes; every HTTP request
 logs one `connect` line when it ends. With the

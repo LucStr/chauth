@@ -10,11 +10,11 @@ import (
 func TestParseDetails(t *testing.T) {
 	const aud = "https://clickhouse.example.com"
 	tests := []struct {
-		name, claim string // claim is JSON; "" means no claim
+		name, claim string // the claim's JSON value; Verify passes only a present claim
 		want        []Detail
 		err         string
 	}{
-		{"no claim", "", nil, ""},
+		{"null refused", `null`, nil, "must be an array"},
 		{"empty array denies all", `[]`, []Detail{}, ""},
 		{"consent and run rows", `[
 			{"type":"clickhouse","locations":["` + aud + `"],"identifier":"*","actions":["read"]},
@@ -36,15 +36,14 @@ func TestParseDetails(t *testing.T) {
 		{"tables on *", `[{"type":"clickhouse","locations":["` + aud + `"],"identifier":"*","tables":[{"name":"items","verbs":["select"]}]}]`, nil, "not *"},
 		{"unknown verb", `[{"type":"clickhouse","locations":["` + aud + `"],"identifier":"core","tables":[{"name":"items","verbs":["drop"]}]}]`, nil, "unknown verb"},
 		{"no verbs", `[{"type":"clickhouse","locations":["` + aud + `"],"identifier":"core","tables":[{"name":"items","verbs":[]}]}]`, nil, "no verbs"},
-		{"not an array", `{"type":"clickhouse"}`, nil, "not an array"},
+		{"not an array", `{"type":"clickhouse"}`, nil, "must be an array"},
+		{"array of non-objects", `[1]`, nil, "not an array of known rows"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var raw any
-			if tt.claim != "" {
-				if err := json.Unmarshal([]byte(tt.claim), &raw); err != nil {
-					t.Fatal(err)
-				}
+			if err := json.Unmarshal([]byte(tt.claim), &raw); err != nil {
+				t.Fatal(err)
 			}
 			got, err := ParseDetails(raw, DetailsType, aud)
 			if tt.err != "" {

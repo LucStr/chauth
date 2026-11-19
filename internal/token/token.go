@@ -248,8 +248,10 @@ func (v *Verifier) Verify(ctx context.Context, raw string) (Claims, error) {
 	if c.Scopes, err = stringList(scope, true); err != nil {
 		return Claims{}, fmt.Errorf("%w: claim scope: %v", ErrDenied, err)
 	}
-	if c.Details, err = ParseDetails(all[DetailsClaim], DetailsType, v.cfg.Audience); err != nil {
-		return Claims{}, fmt.Errorf("%w: claim %s: %v", ErrDenied, DetailsClaim, err)
+	if raw, ok := all[DetailsClaim]; ok {
+		if c.Details, err = ParseDetails(raw, DetailsType, v.cfg.Audience); err != nil {
+			return Claims{}, fmt.Errorf("%w: claim %s: %v", ErrDenied, DetailsClaim, err)
+		}
 	}
 	return c, nil
 }

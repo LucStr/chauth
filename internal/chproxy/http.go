@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -383,16 +384,18 @@ func (s *Server) tables(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	in, db, err := s.cfg.Resolve(r.URL.Query().Get("db"))
-	if err == nil && db == chconfig.DefaultDatabase {
-		err = errors.New("name a database: db=<db> or db=<instance>/<db>")
+	target := r.URL.Query().Get("db")
+	in, db, err := s.cfg.Resolve(target)
+	if err == nil && !slices.Contains(in.Databases, db) {
+		err = fmt.Errorf("serves no database %q", target)
 	}
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, chapi.Error{Error: err.Error()})
+	if target == "" || err != nil {
+		writeJSON(w, http.StatusNotFound, chapi.Error{Error: fmt.Sprintf("database %q is not served; db must be <db> or <instance>/<db>", target)})
 		return
 	}
-	if s.reachOf(policy, claims, in).Databases[db] < rbac.Read {
-		writeJSON(w, http.StatusForbidden, chapi.Error{Error: fmt.Sprintf("this token cannot read %s/%s", in.Name, db)})
+	rc := s.reachOf(policy, claims, in)
+	if !rc.reaches(db) {
+		writeJSON(w, http.StatusForbidden, chapi.Error{Error: fmt.Sprintf("this token has no access to %s/%s", in.Name, db)})
 		return
 	}
 	out := []chapi.Table{}
@@ -411,6 +414,11 @@ func (s *Server) tables(w http.ResponseWriter, r *http.Request) {
 		out = append(out, chapi.Table{Schema: db, Table: row.Table, EstimatedRows: row.Rows})
 		return nil
 	})
+	if rc.Databases[db] == rbac.None {
+		out = slices.DeleteFunc(out, func(t chapi.Table) bool {
+			return !slices.ContainsFunc(rc.tables, func(g rbac.TableGrant) bool { return g.Database == db && g.Table == t.Table })
+		})
+	}
 	if err != nil {
 		s.log.Warn("list tables", "instance", in.Name, "db", db, "error", err)
 		writeJSON(w, http.StatusBadGateway, chapi.Error{Error: "could not list the tables upstream"})

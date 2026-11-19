@@ -176,14 +176,21 @@ token without it gets exactly what the bindings and the scope cap give. Each row
 | `type` | rows of another type are skipped |
 | `locations` | exactly one, equal to `oidc.audience` |
 | `identifier` | `*` or a database name (on every instance that serves it); the database's own rows win over `*` |
-| `actions` | `read` or `write` (write includes read): the whole database at that level |
-| `tables` | `[{name, verbs}]`, the bare table name and any of `select`, `insert`, `update`, `delete`; a database with table rows reaches only those tables, and table rows win over `actions` rows |
+| `actions` | consent row: `read` or `write` (write includes read), the whole database at most at that level |
+| `tables` | run row: `[{name, verbs}]`, the bare table name and any of `select`, `insert`, `update`, `delete`; a database with run rows reaches only those tables |
 
-A row with an unknown field, both or neither of `actions` and `tables`, `tables` on `*`, or a
-location other than the audience refuses the token (497, or 401 on `/v1/access`). Every row only
-narrows: the level is at most the binding's after the scope cap, a verb beyond it is dropped, and a
-database without a row is not reached. Named roles (`instances[].roles`) follow the `*` row's level
-and are dropped without one. Table rows on a read-only database give nothing.
+A present claim that is `null` or not an array, a row with an unknown field, both or neither of
+`actions` and `tables`, `tables` on `*`, or a location other than the audience refuses the token
+(497, or 401 on `/v1/access`); only an absent claim means no claim.
+
+chauth caps by bindings ∩ scope cap ∩ the rows in the token, and every row only narrows. A
+database's consent level is its own `actions` rows, else the `*` rows. Run rows keep each verb the
+level allows (`select` needs read, the rest write) when the token also carries a consent row for
+that database, else the bindings after the scope cap; a token whose verbs all exceed it is refused
+on that database. A narrowed run token carries only run rows: that the run stays within consent is
+the issuer's check, not chauth's. A database without a row is not reached. Named roles
+(`instances[].roles`) follow the `*` row's level, and are dropped without one or when any row names
+tables. Run rows on a read-only database give nothing.
 
 Tables are granted to the temp user directly (`SELECT`, `INSERT`, `ALTER UPDATE`, `ALTER DELETE` on
 `<db>.<table>`), never DDL, and go away with the user; the template roles of that database are not
@@ -191,8 +198,9 @@ granted. The admin needs those privileges on `<db>.*` `WITH GRANT OPTION` ([upst
 setup](#upstream-setup)). Every `connect` line logs them as `tables` (`<db>.<table>:<verb>`).
 
 `GET /v1/tables?db=<db>` (or `<instance>/<db>`) with `Authorization: Bearer <token>`: the tables of a
-database the token reads whole, with the rows of their active parts. 403 when the token does not
-read the database whole (a token limited to tables included), 400 for an unknown database.
+database the token reaches, with the rows of their active parts; a token limited to tables gets only
+those tables. 403 when the token reaches nothing in the database, 404 for an empty, unknown or
+unserved `db`.
 
 ```json
 [{"schema": "core", "table": "items", "estimatedRows": 48000}]
