@@ -3,6 +3,7 @@ package chusers
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/LucStr/chauth/internal/chconfig"
+	"github.com/LucStr/chauth/internal/rbac"
 )
 
 // Error is a ClickHouse exception returned over HTTP.
@@ -61,6 +63,47 @@ func (a *Admin) Rows(ctx context.Context, query string, row func([]byte) error) 
 		return err
 	}
 	return a.run(ctx, creds.Username, creds.Password, query+" FORMAT JSONEachRow", row)
+}
+
+// Upstream reads the own grants of roles from system.grants and the databases with row policies.
+func (a *Admin) Upstream(ctx context.Context, roles []string) (*rbac.Upstream, error) {
+	quoted := make([]string, len(roles))
+	for i, r := range roles {
+		quoted[i] = Literal(r)
+	}
+	u := &rbac.Upstream{Grants: []rbac.RoleGrant{}, RowPolicyDatabases: []string{}}
+	err := a.Rows(ctx, "SELECT role_name, access_type, ifNull(database, '') AS database, ifNull(table, '') AS table, "+
+		"column IS NOT NULL AS column, is_partial_revoke FROM system.grants WHERE role_name IN ("+strings.Join(quoted, ", ")+")",
+		func(line []byte) error {
+			var row struct {
+				Role     string `json:"role_name"`
+				Access   string `json:"access_type"`
+				Database string `json:"database"`
+				Table    string `json:"table"`
+				Column   int    `json:"column"`
+				Revoke   int    `json:"is_partial_revoke"`
+			}
+			if err := json.Unmarshal(line, &row); err != nil {
+				return err
+			}
+			u.Grants = append(u.Grants, rbac.RoleGrant{Role: row.Role, Access: row.Access, Database: row.Database, Table: row.Table,
+				Column: row.Column != 0, PartialRevoke: row.Revoke != 0})
+			return nil
+		})
+	if err != nil {
+		return nil, err
+	}
+	err = a.Rows(ctx, "SELECT DISTINCT database FROM system.row_policies", func(line []byte) error {
+		var row struct {
+			Database string `json:"database"`
+		}
+		if err := json.Unmarshal(line, &row); err != nil {
+			return err
+		}
+		u.RowPolicyDatabases = append(u.RowPolicyDatabases, row.Database)
+		return nil
+	})
+	return u, err
 }
 
 // Ping checks that the admin login works.

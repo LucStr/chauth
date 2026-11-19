@@ -29,6 +29,8 @@ type Claims struct {
 	Groups []string
 	Scopes []string
 	Expiry time.Time
+	// Details are the authorization_details rows for chauth; nil when the token has no such claim.
+	Details []Detail
 }
 
 type Verifier struct {
@@ -246,7 +248,35 @@ func (v *Verifier) Verify(ctx context.Context, raw string) (Claims, error) {
 	if c.Scopes, err = stringList(scope, true); err != nil {
 		return Claims{}, fmt.Errorf("%w: claim scope: %v", ErrDenied, err)
 	}
+	if c.Details, err = details(tok, v.cfg.Audience); err != nil {
+		return Claims{}, fmt.Errorf("%w: claim %s: %v", ErrDenied, DetailsClaim, err)
+	}
 	return c, nil
+}
+
+// details reads the claim from the raw payload, so its key must be spelled exactly and appear once.
+func details(tok *oidc.IDToken, audience string) ([]Detail, error) {
+	var payload json.RawMessage
+	if err := tok.Claims(&payload); err != nil {
+		return nil, err
+	}
+	fields, err := ObjectFields(payload)
+	if err != nil {
+		return nil, err
+	}
+	var raw json.RawMessage
+	for _, f := range fields {
+		if f.Key == DetailsClaim {
+			if raw != nil {
+				return nil, errors.New("appears twice")
+			}
+			raw = f.Value
+		}
+	}
+	if raw == nil {
+		return nil, nil
+	}
+	return ParseDetails(raw, DetailsType, audience)
 }
 
 func reason(err error) string {

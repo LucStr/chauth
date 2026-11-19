@@ -87,7 +87,8 @@ process runs, `GET :8080/readyz` once the issuer's keys and a valid rules set ar
 instance passed a self-test: create a temp user with every role chauth can grant, log in as it, drop it
 ([readiness](docs/config.md#readiness)). On the HTTPS port, `GET /.well-known/chauth` publishes the
 addresses, issuer, audience, scopes and instances for connectors, `GET /v1/access` with a bearer
-token lists what that token reaches, and `GET /ping` answers `Ok.` without a token
+token lists what that token reaches, `GET /v1/tables?db=<db>` lists a database's tables with row
+estimates for a token that reaches it, and `GET /ping` answers `Ok.` without a token
 ([shapes](docs/config.md#discovery-and-access)). Every native connection logs a `connect` line when
 it is decided and a `disconnect` line with its duration and bytes when it closes; every HTTP request
 logs one `connect` line when it ends. With the
@@ -143,12 +144,28 @@ CREATE USER chauth_admin IDENTIFIED WITH sha256_password BY 'Admin-secret-1';
 GRANT CREATE USER, DROP USER ON chauth_tmp_* TO chauth_admin;
 GRANT chauth_core_read, chauth_core_write, chauth_otel_read, chauth_otel_write, chauth_system_read, chauth_querylog_read TO chauth_admin WITH ADMIN OPTION;
 GRANT SELECT(name, valid_until) ON system.users TO chauth_admin;
+-- Run tokens get table privileges directly, only those the binding's role holds; every database in
+-- databases needs its line, a read-only one SELECT only.
+GRANT SELECT, INSERT, ALTER UPDATE, ALTER DELETE ON core.* TO chauth_admin WITH GRANT OPTION;
+GRANT SELECT, INSERT, ALTER UPDATE, ALTER DELETE ON otel.* TO chauth_admin WITH GRANT OPTION;
+GRANT SELECT ON system.* TO chauth_admin WITH GRANT OPTION;
+-- What each role holds, which databases have row policies, and the row estimates of GET /v1/tables.
+GRANT SELECT(role_name, access_type, database, table, column, is_partial_revoke) ON system.grants TO chauth_admin;
+GRANT SELECT(database) ON system.row_policies TO chauth_admin;
+GRANT SELECT(database, table, rows, active) ON system.parts TO chauth_admin;
 ```
 
 - `CREATE USER, DROP USER ON chauth_tmp_*` lets the admin create and drop only users with the
   temp-user prefix (`tempUserPrefix`).
 - Every role a temp user may get must be granted to the admin `WITH ADMIN OPTION`; a role chauth
   cannot grant keeps the instance not ready.
+- `SELECT, INSERT, ALTER UPDATE, ALTER DELETE ON <db>.* WITH GRANT OPTION` for every database (`SELECT`
+  only on a read-only one) lets chauth grant a run token's declared tables to its temp user directly;
+  the self-test grants them too, so a missing one keeps the instance not ready for every token
+  ([authorization details](docs/config.md#authorization-details)).
+- `SELECT(...) ON system.grants` and `SELECT(database) ON system.row_policies` let chauth keep a run
+  token's verbs to what the binding's role holds and off databases with row policies;
+  `SELECT(database, table, rows, active) ON system.parts` gives `GET /v1/tables` its row estimates.
 - Temp-user passwords are 32 random characters with at least two upper-case letters, lower-case
   letters, digits and characters of `!#%*+-=_` each, which meets ClickHouse Cloud's default password
   rules; a stricter `password_complexity` on a self-managed server rejects them, and readiness says so.
@@ -210,8 +227,8 @@ config: [`docs/config.md`](docs/config.md).
   cuts the rest, cancels their queries (up to 5 s) and drops its temp users (up to 10 s); set the
   termination grace period above `shutdownGrace` + 15 s, about 25 s by default
   ([shutdown](docs/config.md#shutdown)).
-- The admin user can grant or revoke the chauth roles (every role it holds `WITH ADMIN OPTION`) on
-  any existing ClickHouse user, not only on temp users; keep its credentials with chauth alone and
+- The admin user can grant or revoke the chauth roles (every role it holds `WITH ADMIN OPTION`) and
+  the table privileges it holds `WITH GRANT OPTION` on any existing ClickHouse user, not only on temp users; keep its credentials with chauth alone and
   limit it by `HOST IP`.
 - The ClickHouse user name is the configured claim (`oidc.usernameClaim`, default `email`), and
   `User` bindings match it. Use an issuer that only issues verified addresses in that claim, or bind

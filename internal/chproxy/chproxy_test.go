@@ -1027,7 +1027,8 @@ func TestSetupSQLInReadme(t *testing.T) {
 // statement chauth sends for it must run, with the role and user quoted.
 func TestMixedCaseDatabase(t *testing.T) {
 	for _, stmt := range []string{"CREATE DATABASE Mixed", "CREATE TABLE Mixed.t (a UInt8) ENGINE = Memory", "INSERT INTO Mixed.t VALUES (1)",
-		"CREATE ROLE chauth_Mixed_read", "GRANT SELECT ON Mixed.* TO chauth_Mixed_read", "GRANT chauth_Mixed_read TO chauth_admin WITH ADMIN OPTION"} {
+		"CREATE ROLE chauth_Mixed_read", "GRANT SELECT ON Mixed.* TO chauth_Mixed_read", "GRANT chauth_Mixed_read TO chauth_admin WITH ADMIN OPTION",
+		"GRANT SELECT ON Mixed.* TO chauth_admin WITH GRANT OPTION"} {
 		mustRoot(t, stmt)
 	}
 	t.Cleanup(func() {
@@ -1674,10 +1675,10 @@ func TestSelfTestMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer lease.Release()
-	if err := m.SelfTest(ctx, []string{"chauth_core_read"}); err != nil {
+	if err := m.SelfTest(ctx, []string{"chauth_core_read"}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := weak.SelfTest(ctx, []string{"chauth_core_read"}); err == nil {
+	if err := weak.SelfTest(ctx, []string{"chauth_core_read"}, nil); err == nil {
 		t.Fatal("self-test with a weak password passed")
 	}
 	var rm metricdata.ResourceMetrics

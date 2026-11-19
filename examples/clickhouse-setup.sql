@@ -29,3 +29,12 @@ CREATE USER chauth_admin IDENTIFIED WITH sha256_password BY 'Admin-secret-1';
 GRANT CREATE USER, DROP USER ON chauth_tmp_* TO chauth_admin;
 GRANT chauth_core_read, chauth_core_write, chauth_otel_read, chauth_otel_write, chauth_system_read, chauth_querylog_read TO chauth_admin WITH ADMIN OPTION;
 GRANT SELECT(name, valid_until) ON system.users TO chauth_admin;
+-- Run tokens get table privileges directly, only those the binding's role holds; every database in
+-- databases needs its line, a read-only one SELECT only.
+GRANT SELECT, INSERT, ALTER UPDATE, ALTER DELETE ON core.* TO chauth_admin WITH GRANT OPTION;
+GRANT SELECT, INSERT, ALTER UPDATE, ALTER DELETE ON otel.* TO chauth_admin WITH GRANT OPTION;
+GRANT SELECT ON system.* TO chauth_admin WITH GRANT OPTION;
+-- What each role holds, which databases have row policies, and the row estimates of GET /v1/tables.
+GRANT SELECT(role_name, access_type, database, table, column, is_partial_revoke) ON system.grants TO chauth_admin;
+GRANT SELECT(database) ON system.row_policies TO chauth_admin;
+GRANT SELECT(database, table, rows, active) ON system.parts TO chauth_admin;

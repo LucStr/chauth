@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+- Tokens may carry `authorization_details` (RFC 9396, type `clickhouse`): consent rows narrow each
+  database to read or write, run rows narrow a database to declared tables and verbs, granted to the
+  temp user directly as `SELECT`, `INSERT`, `ALTER UPDATE`, `ALTER DELETE` and never DDL. chauth caps
+  by bindings ∩ scope cap ∩ the rows in the token; a consent row caps the verbs of that database's run
+  rows, and a run verb is kept only when the binding's role holds it (`system.grants`, a
+  partial revoke anywhere in the database counting for every table), and a database with a row
+  policy gets no run rows. Named roles
+  follow the lowest consent row and are dropped for a token with table rows. Unknown fields or a `null` claim refuse the token; a token without the claim is unchanged.
+  `/v1/access` shows the tables, and `connect` lines log them as `tables`.
+- `GET /v1/tables?db=<db>`: the tables of a database the token reaches (only its declared tables for
+  a run token), with row estimates from active parts; 404 for an unknown database.
+
+Upgrading: before rolling out, grant the admin `SELECT, INSERT, ALTER UPDATE, ALTER DELETE ON <db>.*
+WITH GRANT OPTION` for every database in `databases` (`SELECT` only on a read-only one, such as
+`system`), `SELECT(role_name, access_type, database, table, column, is_partial_revoke) ON
+system.grants`, `SELECT(database) ON system.row_policies` and `SELECT(database, table, rows,
+active) ON system.parts`; see
+`examples/clickhouse-setup.sql`. Readiness now depends on them for every token, not only for tokens
+with `authorization_details`: the self-test grants the table privileges and reads the role grants,
+so without them the instance never becomes ready and refuses every connection, and the log names the
+step `self-test: grant tables to temp user` or `read role grants`. Roll out with old pods kept until
+new ones are ready.
+
 ## v0.1.1 (2026-11-17)
 
 - Fix: temp-user passwords had only lower-case letters and digits, so a server with password

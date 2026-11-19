@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -22,6 +23,8 @@ import (
 	"golang.org/x/net/netutil"
 
 	"github.com/LucStr/chauth/internal/chapi"
+	"github.com/LucStr/chauth/internal/chconfig"
+	"github.com/LucStr/chauth/internal/chusers"
 	"github.com/LucStr/chauth/internal/chwire"
 	"github.com/LucStr/chauth/internal/rbac"
 	"github.com/LucStr/chauth/internal/token"
@@ -60,6 +63,7 @@ func (s *Server) Handler() http.Handler {
 		s.discovery(w, r)
 	})
 	mux.HandleFunc("GET "+chapi.AccessPath, s.access)
+	mux.HandleFunc("GET "+chapi.TablesPath, s.tables)
 	mux.HandleFunc("GET /ping", func(w http.ResponseWriter, _ *http.Request) {
 		closeAfter(w)
 		_, _ = io.WriteString(w, "Ok.\n")
@@ -309,13 +313,14 @@ func (s *Server) discovery(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, d)
 }
 
-func (s *Server) access(w http.ResponseWriter, r *http.Request) {
+// bearer verifies the request's Bearer token and loads the rules; on failure it has answered.
+func (s *Server) bearer(w http.ResponseWriter, r *http.Request) (*rbac.Policy, token.Claims, bool) {
 	raw, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if !ok {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="chauth"`)
 		closeAfter(w)
 		writeJSON(w, http.StatusUnauthorized, chapi.Error{Error: "send the database token as Authorization: Bearer <token>"})
-		return
+		return nil, token.Claims{}, false
 	}
 	claims, err := s.verifier.Verify(r.Context(), raw)
 	if err != nil {
@@ -325,30 +330,99 @@ func (s *Server) access(w http.ResponseWriter, r *http.Request) {
 		}
 		closeAfter(w)
 		writeJSON(w, code, chapi.Error{Error: err.Error()})
-		return
+		return nil, claims, false
 	}
 	policy := s.rbac.Policy()
 	if policy == nil {
 		closeAfter(w)
 		writeJSON(w, http.StatusServiceUnavailable, chapi.Error{Error: "access rules are not loaded"})
-		return
+		return nil, claims, false
 	}
+	return policy, claims, true
+}
+
+func (s *Server) reachOf(p *rbac.Policy, claims token.Claims, in chconfig.Instance) reach {
 	scopeCap := rbac.ScopeCap(claims.Scopes, s.cfg.OIDC.Scopes.Read, s.cfg.OIDC.Scopes.Write)
 	who := rbac.Who{User: claims.Username, Groups: claims.Groups, FoldUser: s.cfg.OIDC.FoldUsername()}
+	return reachOf(p, who, in, scopeCap, claims.Details, s.instances[in.Name].grants())
+}
+
+func (s *Server) access(w http.ResponseWriter, r *http.Request) {
+	policy, claims, ok := s.bearer(w, r)
+	if !ok {
+		return
+	}
 	out := []chapi.Access{}
 	for _, in := range s.cfg.Instances {
-		g := grants(policy, who, in, scopeCap)
-		e := chapi.Access{Instance: in.Name, Databases: []chapi.DatabaseAccess{}, Roles: nonNil(g.Roles)}
+		rc := s.reachOf(policy, claims, in)
+		e := chapi.Access{Instance: in.Name, Level: rc.level.String(), Databases: []chapi.DatabaseAccess{}, Roles: nonNil(rc.Roles)}
 		for _, db := range in.Databases {
-			if lv := g.Databases[db]; lv > rbac.None {
-				e.Databases = append(e.Databases, chapi.DatabaseAccess{Database: db, Level: lv.String()})
+			if !rc.reaches(db) {
+				continue
 			}
+			da, lv := chapi.DatabaseAccess{Database: db}, rc.Databases[db]
+			for _, t := range rc.tables {
+				if t.Database == db {
+					da.Tables = append(da.Tables, chapi.TableAccess{Table: t.Table, Verb: t.Verb})
+					lv = max(lv, rbac.VerbLevel(t.Verb))
+				}
+			}
+			da.Level = lv.String()
+			e.Databases = append(e.Databases, da)
 		}
-		if len(e.Databases) == 0 && len(e.Roles) == 0 {
-			continue
+		if len(e.Databases) > 0 || len(e.Roles) > 0 {
+			out = append(out, e)
 		}
-		e.Level = level(policy, who, in.Name, scopeCap, g).String()
-		out = append(out, e)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// tables lists the tables of one database the token reaches with their row counts, from active parts,
+// only the declared ones for a token limited to tables; the admin login runs the query.
+func (s *Server) tables(w http.ResponseWriter, r *http.Request) {
+	policy, claims, ok := s.bearer(w, r)
+	if !ok {
+		return
+	}
+	target := r.URL.Query().Get("db")
+	in, db, err := s.cfg.Resolve(target)
+	if err == nil && !slices.Contains(in.Databases, db) {
+		err = fmt.Errorf("serves no database %q", target)
+	}
+	if target == "" || err != nil {
+		writeJSON(w, http.StatusNotFound, chapi.Error{Error: fmt.Sprintf("database %q is not served; db must be <db> or <instance>/<db>", target)})
+		return
+	}
+	rc := s.reachOf(policy, claims, in)
+	if !rc.reaches(db) {
+		writeJSON(w, http.StatusForbidden, chapi.Error{Error: fmt.Sprintf("this token has no access to %s/%s", in.Name, db)})
+		return
+	}
+	out := []chapi.Table{}
+	lit := chusers.Literal(db)
+	err = s.instances[in.Name].admin.Rows(r.Context(), "SELECT t.name AS table, sum(p.rows) AS rows FROM system.tables AS t "+
+		"LEFT JOIN (SELECT table, rows FROM system.parts WHERE database = "+lit+" AND active) AS p ON p.table = t.name "+
+		"WHERE t.database = "+lit+" AND NOT t.is_temporary GROUP BY t.name ORDER BY t.name "+
+		"SETTINGS output_format_json_quote_64bit_integers = 1", func(line []byte) error {
+		var row struct {
+			Table string `json:"table"`
+			Rows  uint64 `json:"rows,string"`
+		}
+		if err := json.Unmarshal(line, &row); err != nil {
+			return err
+		}
+		out = append(out, chapi.Table{Schema: db, Table: row.Table, EstimatedRows: row.Rows})
+		return nil
+	})
+	if rc.Databases[db] == rbac.None {
+		out = slices.DeleteFunc(out, func(t chapi.Table) bool {
+			return !slices.ContainsFunc(rc.tables, func(g rbac.TableGrant) bool { return g.Database == db && g.Table == t.Table })
+		})
+	}
+	if err != nil {
+		s.log.Warn("list tables", "instance", in.Name, "db", db, "error", err)
+		writeJSON(w, http.StatusBadGateway, chapi.Error{Error: "could not list the tables upstream"})
+		return
 	}
 	writeJSON(w, http.StatusOK, out)
 }

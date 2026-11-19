@@ -395,7 +395,28 @@ func (in Instance) UpstreamRoles(g rbac.Granted) []string {
 // GrantableRoles are every upstream role a temp user on in can get: each database's roles at both
 // levels after Cap, and the named roles; sorted and without duplicates.
 func (in Instance) GrantableRoles() []string {
-	out := slices.Clone(in.Roles)
+	out := append(slices.Clone(in.Roles), in.TemplateRoles()...)
+	sort.Strings(out)
+	return slices.Compact(out)
+}
+
+// GrantableTables are the direct privileges a run token can give, as whole-database grants: select
+// on every database, and the write verbs outside readOnlyDatabases. The admin needs them WITH GRANT OPTION.
+func (in Instance) GrantableTables() []rbac.TableGrant {
+	var out []rbac.TableGrant
+	for _, db := range in.Databases {
+		for _, v := range []string{"select", "insert", "update", "delete"} {
+			if v == "select" || !slices.Contains(in.ReadOnlyDatabases, db) {
+				out = append(out, rbac.TableGrant{Database: db, Verb: v})
+			}
+		}
+	}
+	return out
+}
+
+// TemplateRoles are the roles roleTemplate gives each database at both levels after Cap, sorted.
+func (in Instance) TemplateRoles() []string {
+	var out []string
 	for _, db := range in.Databases {
 		out = append(out, in.RoleFor(db, rbac.Read), in.RoleFor(db, rbac.Write))
 	}
