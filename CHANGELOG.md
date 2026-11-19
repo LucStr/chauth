@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.2.0 (2026-11-19)
 
 - Tokens may carry `authorization_details` (RFC 9396, type `clickhouse`): consent rows narrow each
   database to read or write, run rows narrow a database to declared tables and verbs, granted to the
