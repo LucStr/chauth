@@ -134,19 +134,21 @@ var verbAccess = map[string][]string{
 	"delete": {"ALTER DELETE", "ALTER TABLE", "ALTER", "ALL"},
 }
 
-// Covers reports whether role's own grants hold verb on db.table. A partial revoke of it anywhere in
-// the database counts as not holding it on every table (system.grants shows a prefix revoke such as
-// sec* as table sec), and so do column-level grants and roles granted to role.
+// Covers reports whether role's own grants hold verb on db.table. Any partial revoke of the verb
+// counts as not holding it anywhere, since system.grants shows prefix revokes (review_*.*, sec*) by
+// their prefix only; so do column-level grants and roles granted to role.
 func Covers(grants []RoleGrant, role string, g TableGrant) bool {
 	access, covered := verbAccess[g.Verb], false
 	for _, r := range grants {
-		if r.Role != role || !slices.Contains(access, r.Access) || r.Database != "" && r.Database != g.Database {
+		if r.Role != role || !slices.Contains(access, r.Access) {
 			continue
 		}
 		if r.PartialRevoke {
 			return false
 		}
-		covered = covered || r.Table == "" || r.Table == g.Table && !r.Column
+		if r.Database == "" || r.Database == g.Database {
+			covered = covered || r.Table == "" || r.Table == g.Table && !r.Column
+		}
 	}
 	return covered
 }

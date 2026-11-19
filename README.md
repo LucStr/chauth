@@ -152,6 +152,7 @@ GRANT SELECT ON system.* TO chauth_admin WITH GRANT OPTION;
 -- What each role holds, which databases have row policies, and the row estimates of GET /v1/tables.
 GRANT SELECT(role_name, access_type, database, table, column, is_partial_revoke) ON system.grants TO chauth_admin;
 GRANT SELECT(database) ON system.row_policies TO chauth_admin;
+GRANT SHOW ROW POLICIES ON *.* TO chauth_admin;
 GRANT SELECT(database, table, rows, active) ON system.parts TO chauth_admin;
 ```
 
@@ -163,7 +164,8 @@ GRANT SELECT(database, table, rows, active) ON system.parts TO chauth_admin;
   only on a read-only one) lets chauth grant a run token's declared tables to its temp user directly;
   the self-test grants them too, so a missing one keeps the instance not ready for every token
   ([authorization details](docs/config.md#authorization-details)).
-- `SELECT(...) ON system.grants` and `SELECT(database) ON system.row_policies` let chauth keep a run
+- `SELECT(...) ON system.grants`, `SELECT(database) ON system.row_policies` and `SHOW ROW POLICIES`
+  (without which some servers return no policies) let chauth keep a run
   token's verbs to what the binding's role holds and off databases with row policies;
   `SELECT(database, table, rows, active) ON system.parts` gives `GET /v1/tables` its row estimates.
 - Temp-user passwords are 32 random characters with at least two upper-case letters, lower-case
