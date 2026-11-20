@@ -24,6 +24,7 @@ chauth connect   # then: clickhouse-client -d prod/core, curl localhost:8123 --d
 | `tls.certFile`, `tls.keyFile` | required | certificate of both listeners |
 | `oidc.issuer`, `oidc.audience` | required | token issuer and audience |
 | `oidc.allowedClients` | required, non-empty | clients whose tokens are accepted; startup fails when empty |
+| `oidc.requireDetailsClients` | none | clients whose tokens must carry [`authorization_details`](#authorization-details); a token from one without the claim is refused, so an agent's token can never fall back to the bindings alone. Leave people's CLI clients out |
 | `oidc.usernameClaim` / `groupsClaim` / `clientIdClaim` | `email` / `groups` / `client_id` | claim names; the client id falls back to `azp` |
 | `oidc.usernameCaseInsensitive` | `true` | compare `User` subjects ignoring case; privileged bindings are safer on groups than on individual names |
 | `oidc.groupsPrefix` | none | prepended to every group before bindings are matched |
@@ -182,7 +183,11 @@ token without it gets exactly what the bindings and the scope cap give. Each row
 A present claim that is `null` or not an array, a claim or field name not spelled exactly or given
 twice, a row with an unknown field, both or neither of
 `actions` and `tables`, `tables` on `*`, or a location other than the audience refuses the token
-(497, or 401 on `/v1/access`); only an absent claim means no claim.
+(497, or 401 on `/v1/access`); only an absent claim means no claim, and only from a client not in
+`oidc.requireDetailsClients`.
+
+A token with run rows lasts no longer than its `exp`: its native connection is cut and its HTTP
+request cancelled then, and its temp user is not handed out after it, instead of `maxConnectionAge`.
 
 chauth caps by bindings ∩ scope cap ∩ the rows in the token, and every row only narrows. A
 database's consent level is its own `actions` rows, else the `*` rows. Run rows keep each verb the

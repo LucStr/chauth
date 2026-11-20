@@ -1,7 +1,11 @@
 # Changelog
 
-## v0.2.0 (2026-11-19)
+## v0.2.0 (2026-11-20)
 
+- `oidc.requireDetailsClients`: tokens from these clients must carry `authorization_details`; without
+  the claim they are refused instead of getting the bindings alone. Default none.
+- A token with run rows lasts no longer than its `exp`: its native connection is cut and its HTTP
+  request cancelled then, and its temp user is not handed out past it.
 - Tokens may carry `authorization_details` (RFC 9396, type `clickhouse`): consent rows narrow each
   database to read or write, run rows narrow a database to declared tables and verbs, granted to the
   temp user directly as `SELECT`, `INSERT`, `ALTER UPDATE`, `ALTER DELETE` and never DDL. chauth caps

@@ -14,6 +14,7 @@ oidc:
   issuer: https://auth.example.com/              # required
   audience: https://clickhouse.example.com       # required
   allowedClients: [example-cli, example-agent]   # required, non-empty: tokens of any other client are refused
+  requireDetailsClients: [example-agent]         # example (default none): these clients' tokens must carry authorization_details
   usernameClaim: email
   usernameCaseInsensitive: true   # privileged bindings are safer on groups than on individual names
   groupsClaim: groups

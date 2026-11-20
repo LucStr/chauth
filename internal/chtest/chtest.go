@@ -192,6 +192,8 @@ type Claims struct {
 	User, Client, Audience, Scope string
 	Groups                        []string
 	Expired                       bool
+	// TTL overrides the default 15-minute lifetime.
+	TTL time.Duration
 	// Alg is RS256 (default) or ES256; Kid overrides the key's own id.
 	Alg, Kid string
 	// Details, when set, is the authorization_details claim.
@@ -259,6 +261,9 @@ func (is *Issuer) Token(c Claims) string {
 	set(&c.User, User)
 	set(&c.Scope, "clickhouse:read")
 	exp := time.Now().Add(15 * time.Minute)
+	if c.TTL > 0 {
+		exp = time.Now().Add(c.TTL)
+	}
 	if c.Expired {
 		exp = time.Now().Add(-time.Minute)
 	}
