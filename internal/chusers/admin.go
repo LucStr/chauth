@@ -65,8 +65,9 @@ func (a *Admin) Rows(ctx context.Context, query string, row func([]byte) error) 
 	return a.run(ctx, creds.Username, creds.Password, query+" FORMAT JSONEachRow", row)
 }
 
-// Upstream reads the own grants of roles from system.grants and the databases with row policies.
-func (a *Admin) Upstream(ctx context.Context, roles []string) (*rbac.Upstream, error) {
+// Upstream reads the own grants of roles from system.grants and which of dbs have row policies; a
+// database whose policies the admin may not see (no SHOW ROW POLICIES on it) counts as having one.
+func (a *Admin) Upstream(ctx context.Context, roles, dbs []string) (*rbac.Upstream, error) {
 	quoted := make([]string, len(roles))
 	for i, r := range roles {
 		quoted[i] = Literal(r)
@@ -97,16 +98,18 @@ func (a *Admin) Upstream(ctx context.Context, roles []string) (*rbac.Upstream, e
 	if err != nil {
 		return nil, err
 	}
-	visible := false
-	err = a.run(ctx, creds.Username, creds.Password, "CHECK GRANT SHOW ROW POLICIES ON *.*", func(line []byte) error {
-		visible = strings.TrimSpace(string(line)) == "1"
-		return nil
-	})
-	if err == nil && !visible {
-		err = errors.New("the admin lacks SHOW ROW POLICIES ON *.*, so system.row_policies may hide policies")
-	}
-	if err != nil {
-		return nil, err
+	for _, db := range dbs {
+		visible := false
+		err = a.run(ctx, creds.Username, creds.Password, "CHECK GRANT SHOW ROW POLICIES ON "+Ident(db)+".*", func(line []byte) error {
+			visible = strings.TrimSpace(string(line)) == "1"
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		if !visible {
+			u.RowPolicyDatabases = append(u.RowPolicyDatabases, db)
+		}
 	}
 	err = a.Rows(ctx, "SELECT DISTINCT database FROM system.row_policies", func(line []byte) error {
 		var row struct {

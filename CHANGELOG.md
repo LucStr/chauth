@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.2.1 (2026-11-20)
+
+- Fix: v0.2.0 never became ready on ClickHouse Cloud, whose default user cannot grant `SELECT ON
+  system.* WITH GRANT OPTION` or `SHOW ROW POLICIES ON *.*`. On a read-only database the self-test
+  and run tokens now use only the tables its read role names, and `SHOW ROW POLICIES` is checked per
+  database: a database without it takes no run tokens instead of keeping the instance not ready.
+
+Upgrading from v0.2.0: grant the admin `SELECT ... WITH GRANT OPTION` on each table a read-only
+database's read role names (for example `system.parts`) instead of `system.*`, and `SHOW ROW
+POLICIES ON <db>.*` for each database that should take run tokens instead of `ON *.*`; the other
+v0.2.0 grants stay. See `examples/clickhouse-setup.sql`.
+
 ## v0.2.0 (2026-11-20)
 
 - `oidc.requireDetailsClients`: tokens from these clients must carry `authorization_details`; without
