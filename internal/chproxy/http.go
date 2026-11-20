@@ -186,6 +186,11 @@ func (s *Server) proxyHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		finish("allow", "")
 	}()
+	if len(d.Tables) > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, d.Claims.Expiry)
+		defer cancel()
+	}
 	rp.ServeHTTP(sw, r.WithContext(ctx))
 	completed = r.Context().Err() == nil && upstreamErr == nil
 }

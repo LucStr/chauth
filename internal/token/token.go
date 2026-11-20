@@ -251,6 +251,9 @@ func (v *Verifier) Verify(ctx context.Context, raw string) (Claims, error) {
 	if c.Details, err = details(tok, v.cfg.Audience); err != nil {
 		return Claims{}, fmt.Errorf("%w: claim %s: %v", ErrDenied, DetailsClaim, err)
 	}
+	if c.Details == nil && slices.Contains(v.cfg.RequireDetailsClients, c.ClientID) {
+		return Claims{}, fmt.Errorf("%w: client %q must send the %s claim", ErrDenied, c.ClientID, DetailsClaim)
+	}
 	return c, nil
 }
 

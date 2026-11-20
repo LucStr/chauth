@@ -301,7 +301,19 @@ type Decision struct {
 }
 
 func (d Decision) key() chusers.Key {
-	return chusers.Key{Subject: d.Claims.Subject, Email: d.Claims.Username, Level: d.Level, Roles: d.Roles, Tables: d.Tables}
+	k := chusers.Key{Subject: d.Claims.Subject, Email: d.Claims.Username, Level: d.Level, Roles: d.Roles, Tables: d.Tables}
+	if len(d.Tables) > 0 {
+		k.Until = d.Claims.Expiry
+	}
+	return k
+}
+
+// maxAge is how long a connection may last: limit, and for run intent no longer than the token.
+func (d Decision) maxAge(limit time.Duration) time.Duration {
+	if len(d.Tables) > 0 && !d.Claims.Expiry.IsZero() {
+		return max(0, min(limit, time.Until(d.Claims.Expiry)))
+	}
+	return limit
 }
 
 // decide verifies raw and resolves target into what the token's holder gets there.

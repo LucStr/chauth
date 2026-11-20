@@ -135,7 +135,7 @@ func (s *Server) handleNative(raw net.Conn, verified func()) {
 	finish("allow", "")
 	_ = raw.SetDeadline(time.Time{})
 	start := time.Now()
-	in2up, up2in, reason := splice(conn, br, up, upr, time.Duration(s.cfg.Limits.MaxConnectionAge), s.stopping)
+	in2up, up2in, reason := splice(conn, br, up, upr, d.maxAge(time.Duration(s.cfg.Limits.MaxConnectionAge)), s.stopping)
 	s.log.InfoContext(ctx, "disconnect", "sub", a.sub, "user", a.user, "instance", a.instance, "db", a.db, "temp_user", a.tempUser,
 		"protocol", a.protocol, "reason", reason, "duration_ms", time.Since(start).Milliseconds(), "bytes_in", in2up, "bytes_out", up2in)
 }

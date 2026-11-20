@@ -39,6 +39,8 @@ type Key struct {
 	Roles []string
 	// Tables are privileges granted to the user directly; an empty Table means the whole database.
 	Tables []rbac.TableGrant
+	// Until, when set, ends handing the user out: a new user's lease ends no later than this.
+	Until time.Time
 }
 
 func (k Key) id() string {
@@ -177,6 +179,9 @@ func (m *Manager) Acquire(ctx context.Context, k Key) (*Lease, error) {
 		e = &entry{
 			name: m.userName(k.Subject), password: m.opts.Password(), key: id,
 			leaseEnd: now.Add(m.opts.LeaseDuration), ready: make(chan struct{}),
+		}
+		if !k.Until.IsZero() && k.Until.Before(e.leaseEnd) {
+			e.leaseEnd = k.Until
 		}
 		e.validUntil = e.leaseEnd.Add(m.opts.MaxConnectionAge + validGrace)
 		m.current[id] = e

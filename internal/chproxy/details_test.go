@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/LucStr/chauth/internal/chapi"
 	"github.com/LucStr/chauth/internal/chconfig"
@@ -42,6 +43,7 @@ func TestAuthorizationDetails(t *testing.T) {
 	insertRole := chRole("ins", "{instance: main, role: chauth_core_insert, level: write}") + binding("ins", "ins", user(chtest.User))
 	h := start(t, chRole("everything", `{instance: main, database: "*", level: write}`)+binding("everything", "everything", user(chtest.User))+queryLog+insertRole,
 		func(c *chconfig.Config) {
+			c.OIDC.RequireDetailsClients = []string{chtest.Client}
 			c.Instances[0].Roles = append(c.Instances[0].Roles, "chauth_core_insert")
 			c.Instances[0].Databases = append(c.Instances[0].Databases, "rev", "pol", "glob_x")
 		})
@@ -71,7 +73,8 @@ func TestAuthorizationDetails(t *testing.T) {
 	secretRun := func(db string) string {
 		return tok(row(db, "tables", []any{map[string]any{"name": "secret", "verbs": []string{"select", "insert"}}}))
 	}
-	none := tok()
+	none := shared.Issuer.Token(chtest.Claims{Scope: "clickhouse:write", Client: chtest.CLIClient})
+	agentWithout := tok()
 	null := shared.Issuer.Token(chtest.Claims{Scope: "clickhouse:write", Details: json.RawMessage("null")})
 	denied := int32(chwire.CodeAccessDenied)
 	tests := []struct {
@@ -101,6 +104,7 @@ func TestAuthorizationDetails(t *testing.T) {
 		{"run: database-prefix revoke on the role refuses", secretRun("glob_x"), "glob_x", "SELECT count() FROM glob_x.secret", denied},
 		{"run: row policy refuses the database", secretRun("pol"), "pol", "SELECT count() FROM pol.secret", denied},
 		{"no claim: row policy applies", none, "pol", "SELECT count() FROM pol.secret HAVING count() = 1", 0},
+		{"required client without the claim", agentWithout, "otel", "SELECT 1", denied},
 		{"no claim: today's access", none, "otel", "INSERT INTO otel.spans VALUES (42)", 0},
 		{"null claim refused", null, "otel", "SELECT 1", denied},
 	}
@@ -127,6 +131,20 @@ func TestAuthorizationDetails(t *testing.T) {
 		})
 	}
 
+	t.Run("run token ends the connection at its expiry", func(t *testing.T) {
+		short := shared.Issuer.Token(chtest.Claims{Scope: "clickhouse:write", TTL: 2 * time.Second,
+			Details: []any{row("core", "tables", []any{map[string]any{"name": "items", "verbs": []string{"select"}}})}})
+		c, err := h.nativeOpen(ctx, "core", short, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		start := time.Now()
+		err = c.Exec(ctx, "SELECT sleep(3) UNION ALL SELECT sleep(3) UNION ALL SELECT sleep(3) SETTINGS max_threads = 1")
+		if err == nil || time.Since(start) > 6*time.Second {
+			t.Errorf("a 9s query ran %s on a 2s run token: %v", time.Since(start).Round(time.Second), err)
+		}
+	})
 	for _, tt := range []struct {
 		tok, db string
 		status  int

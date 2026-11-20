@@ -39,6 +39,8 @@ type OIDC struct {
 	ClientIDClaim string `json:"clientIdClaim"`
 	// AllowedClients are the clients whose tokens are accepted; serve's config requires at least one.
 	AllowedClients []string `json:"allowedClients"`
+	// RequireDetailsClients are clients whose tokens must carry authorization_details.
+	RequireDetailsClients []string `json:"requireDetailsClients"`
 }
 
 // Scopes are the token scopes that cap access at read or allow write; a token with neither is refused.
