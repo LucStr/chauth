@@ -37,4 +37,5 @@ GRANT SELECT ON system.* TO chauth_admin WITH GRANT OPTION;
 -- What each role holds, which databases have row policies, and the row estimates of GET /v1/tables.
 GRANT SELECT(role_name, access_type, database, table, column, is_partial_revoke) ON system.grants TO chauth_admin;
 GRANT SELECT(database) ON system.row_policies TO chauth_admin;
+GRANT SHOW ROW POLICIES ON *.* TO chauth_admin;
 GRANT SELECT(database, table, rows, active) ON system.parts TO chauth_admin;

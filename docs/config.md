@@ -197,8 +197,9 @@ A run row's verb is also kept only when the role the binding gives on that datab
 (`roleTemplate` at the binding's level after the caps) holds it itself, read from `system.grants`
 after every passing self-test: a grant on the database or the table, or a parent privilege
 (`ALTER` for `ALTER UPDATE`); a column-level grant, a partial revoke touching the table, or a role
-granted to that role count as not holding it, and a partial revoke of the verb anywhere in the
-database counts for every table of it (`system.grants` shows a prefix revoke `sec*` as table `sec`).
+granted to that role count as not holding it, and any partial revoke of the verb on the role counts
+for every database and table (`system.grants` shows prefix revokes such as `review_*.*` or `sec*`
+by their prefix only).
 A database with any row policy (`system.row_policies`, on a table or the whole database) gets no run
 rows at all, because a direct grant would not carry a policy aimed at the binding's role. So a
 direct table grant never reaches past what the binding's role reaches. chauth reads both after every
@@ -211,7 +212,9 @@ The `bindings` field of `connect` lines lists the bindings that gave anything be
 Tables are granted to the temp user directly (`SELECT`, `INSERT`, `ALTER UPDATE`, `ALTER DELETE` on
 `<db>.<table>`), never DDL, and go away with the user; the template roles of that database are not
 granted. The admin needs those privileges on `<db>.*` `WITH GRANT OPTION`, `SELECT` only on a
-read-only database, `SELECT` on the listed columns of `system.grants` and `SELECT(database)` on `system.row_policies` ([upstream
+read-only database, `SELECT` on the listed columns of `system.grants`, `SELECT(database)` on `system.row_policies` and
+`SHOW ROW POLICIES ON *.*`, which the readiness check requires (`CHECK GRANT`) since a server may
+hide policies without it ([upstream
 setup](#upstream-setup)). Every `connect` line logs them as `tables` (`<db>.<table>:<verb>`).
 
 `GET /v1/tables?db=<db>` (or `<instance>/<db>`) with `Authorization: Bearer <token>`: the tables of a
