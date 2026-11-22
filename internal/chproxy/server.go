@@ -96,10 +96,16 @@ func New(cfg *chconfig.Config, verifier *token.Verifier, store *rbac.Store, tlsC
 				IdleTTL: time.Duration(l.TempUserIdleTTL), MaxRefs: l.MaxConnectionsPerTempUser, Log: log,
 			}),
 		}
-		roles, tables, templates := in.GrantableRoles(), in.GrantableTables(), in.TemplateRoles()
-		inst.selfTest = func(ctx context.Context) error { return inst.users.SelfTest(ctx, roles, tables) }
+		roles, templates, dbs := in.GrantableRoles(), in.TemplateRoles(), slices.Clone(in.Databases)
+		inst.selfTest = func(ctx context.Context) error {
+			var tables []rbac.TableGrant
+			if u := inst.grants(); u != nil {
+				tables = in.GrantableTables(u.Grants)
+			}
+			return inst.users.SelfTest(ctx, roles, tables)
+		}
 		inst.readGrants = func(ctx context.Context) error {
-			u, err := inst.admin.Upstream(ctx, templates)
+			u, err := inst.admin.Upstream(ctx, templates, dbs)
 			if err == nil {
 				inst.upstream.Store(u)
 			}
@@ -140,14 +146,14 @@ func (s *Server) watch(ctx context.Context, in *instance) {
 			}
 		}
 		if err == nil {
-			step, err = "self-test", in.selfTest(ctx)
-			if se := (*chusers.StepError)(nil); errors.As(err, &se) {
-				step, err = "self-test: "+se.Step, se.Err
+			if err = in.readGrants(ctx); err != nil {
+				step = "read role grants"
 			}
 		}
 		if err == nil {
-			if err = in.readGrants(ctx); err != nil {
-				step = "read role grants"
+			step, err = "self-test", in.selfTest(ctx)
+			if se := (*chusers.StepError)(nil); errors.As(err, &se) {
+				step, err = "self-test: "+se.Step, se.Err
 			}
 		}
 		if ctx.Err() != nil {

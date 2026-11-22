@@ -20,14 +20,20 @@ func TestAuthorizationDetails(t *testing.T) {
 	setup := []string{"CREATE ROLE IF NOT EXISTS chauth_core_insert", "GRANT INSERT ON core.* TO chauth_core_insert",
 		"GRANT chauth_core_insert TO chauth_admin WITH ADMIN OPTION"}
 	// rev: the write role has a table-prefix revoke; pol: a table has a row policy; glob_x: the write
-	// role holds SELECT on *.* with a database-prefix revoke.
-	for _, db := range []string{"rev", "pol", "glob_x"} {
+	// role holds SELECT on *.* with a database-prefix revoke; blind: the admin may not see its policies.
+	for _, db := range []string{"rev", "pol", "glob_x", "blind"} {
 		setup = append(setup, "CREATE DATABASE "+db, "CREATE TABLE "+db+".secret (id UInt8) ENGINE = Memory", "INSERT INTO "+db+".secret VALUES (1), (2)",
 			"CREATE ROLE chauth_"+db+"_read", "GRANT SELECT ON "+db+".* TO chauth_"+db+"_read",
 			"CREATE ROLE chauth_"+db+"_write", "GRANT SELECT, INSERT ON "+db+".* TO chauth_"+db+"_write",
 			"GRANT chauth_"+db+"_read, chauth_"+db+"_write TO chauth_admin WITH ADMIN OPTION",
 			"GRANT SELECT, INSERT, ALTER UPDATE, ALTER DELETE ON "+db+".* TO chauth_admin WITH GRANT OPTION")
 	}
+	// ro: read-only, its read role names one table, and the admin can grant only that one.
+	setup = append(setup, "GRANT SHOW ROW POLICIES ON rev.* TO chauth_admin", "GRANT SHOW ROW POLICIES ON pol.* TO chauth_admin",
+		"GRANT SHOW ROW POLICIES ON glob_x.* TO chauth_admin", "GRANT SHOW ROW POLICIES ON ro.* TO chauth_admin",
+		"CREATE DATABASE ro", "CREATE TABLE ro.secret (id UInt8) ENGINE = Memory", "CREATE TABLE ro.other (id UInt8) ENGINE = Memory",
+		"CREATE ROLE chauth_ro_read", "GRANT SELECT ON ro.secret TO chauth_ro_read", "GRANT chauth_ro_read TO chauth_admin WITH ADMIN OPTION",
+		"GRANT SELECT ON ro.secret TO chauth_admin WITH GRANT OPTION")
 	setup = append(setup, "REVOKE SELECT ON rev.sec* FROM chauth_rev_write",
 		"GRANT SELECT ON *.* TO chauth_glob_x_write", "REVOKE SELECT ON glob_*.* FROM chauth_glob_x_write",
 		"CREATE ROW POLICY chauth_test_pol ON pol.secret AS restrictive FOR SELECT USING id = 1 TO chauth_pol_write")
@@ -36,7 +42,8 @@ func TestAuthorizationDetails(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		for _, stmt := range []string{"DROP ROW POLICY IF EXISTS chauth_test_pol ON pol.secret", "DROP DATABASE IF EXISTS rev", "DROP DATABASE IF EXISTS pol", "DROP DATABASE IF EXISTS glob_x",
-			"DROP ROLE IF EXISTS chauth_rev_read, chauth_rev_write, chauth_pol_read, chauth_pol_write, chauth_glob_x_read, chauth_glob_x_write"} {
+			"DROP DATABASE IF EXISTS blind", "DROP DATABASE IF EXISTS ro", "DROP ROLE IF EXISTS chauth_rev_read, chauth_rev_write, chauth_pol_read, chauth_pol_write, " +
+				"chauth_glob_x_read, chauth_glob_x_write, chauth_blind_read, chauth_blind_write, chauth_ro_read"} {
 			mustRoot(t, stmt)
 		}
 	})
@@ -45,7 +52,8 @@ func TestAuthorizationDetails(t *testing.T) {
 		func(c *chconfig.Config) {
 			c.OIDC.RequireDetailsClients = []string{chtest.Client}
 			c.Instances[0].Roles = append(c.Instances[0].Roles, "chauth_core_insert")
-			c.Instances[0].Databases = append(c.Instances[0].Databases, "rev", "pol", "glob_x")
+			c.Instances[0].Databases = append(c.Instances[0].Databases, "rev", "pol", "glob_x", "blind", "ro")
+			c.Instances[0].ReadOnlyDatabases = append(c.Instances[0].ReadOnlyDatabases, "ro")
 		})
 	row := func(id string, kv ...any) map[string]any {
 		m := map[string]any{"type": "clickhouse", "locations": []string{chtest.Audience}, "identifier": id}
@@ -75,6 +83,10 @@ func TestAuthorizationDetails(t *testing.T) {
 	}
 	none := shared.Issuer.Token(chtest.Claims{Scope: "clickhouse:write", Client: chtest.CLIClient})
 	agentWithout := tok()
+	roRun := tok(row("ro", "tables", []any{
+		map[string]any{"name": "secret", "verbs": []string{"select", "insert"}},
+		map[string]any{"name": "other", "verbs": []string{"select"}},
+	}))
 	null := shared.Issuer.Token(chtest.Claims{Scope: "clickhouse:write", Details: json.RawMessage("null")})
 	denied := int32(chwire.CodeAccessDenied)
 	tests := []struct {
@@ -97,7 +109,12 @@ func TestAuthorizationDetails(t *testing.T) {
 		{"consent: named role follows star", consent, "core", "SELECT count() FROM system.query_log", 0},
 		{"consent: db read beats a named write role", starWrite, "core", "INSERT INTO core.big VALUES (42)", denied},
 		{"consent: star write", starWrite, "otel", "INSERT INTO otel.spans VALUES (42)", 0},
-		{"run: select on a read-only database", sysRun, "system", "SELECT count() FROM system.parts", 0},
+		{"run: no SHOW ROW POLICIES on system", sysRun, "system", "SELECT count() FROM system.parts", denied},
+		{"run: no SHOW ROW POLICIES on the database", secretRun("blind"), "blind", "SELECT count() FROM blind.secret", denied},
+		{"no claim: database without SHOW ROW POLICIES", none, "blind", "SELECT count() FROM blind.secret", 0},
+		{"run: select on a read-only database", roRun, "ro", "SELECT count() FROM ro.secret", 0},
+		{"run: no insert on a read-only database", roRun, "ro", "INSERT INTO ro.secret VALUES (1)", denied},
+		{"run: read-only table the role does not name", roRun, "ro", "SELECT count() FROM ro.other", denied},
 		{"run: no write on a read-only database", sysRun, "system", "INSERT INTO system.parts SELECT * FROM system.parts LIMIT 0", denied},
 		{"run: only what the binding's role holds", sysRun, "system", "SELECT count() FROM system.query_log", denied},
 		{"run: prefix revoke on the role refuses the database", secretRun("rev"), "rev", "SELECT count() FROM rev.secret", denied},

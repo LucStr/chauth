@@ -114,7 +114,8 @@ serve creates `<tempUserPrefix>_selftest_<pod><random>` (no person's temp user s
 (generated password, a `VALID UNTIL` minutes ahead, `tempUserHostIPs`, `log_comment` and
 `readonly = 2` as `CONST`), grants it in one statement every role the instance can hand out (each
 database's roles at both levels after `readOnlyDatabases`, plus `roles`), then in a second statement
-the four table privileges on every database outside `readOnlyDatabases`, logs in as it the way a new
+the four table privileges on every database outside `readOnlyDatabases` and `SELECT` on each table a
+read-only database's read role names (read from `system.grants` just before), logs in as it the way a new
 temp user is first logged in, and drops it. Until it passes, retried with backoff up to 5 s, the
 instance refuses connections with 210 / 503. It repeats every `limits.selfTestInterval`. Once ready,
 an instance turns not ready only after 3 failed checks in a row, retried 1 s apart, and then retries
@@ -206,7 +207,10 @@ granted to that role count as not holding it, and any partial revoke of the verb
 for every database and table (`system.grants` shows prefix revokes such as `review_*.*` or `sec*`
 by their prefix only).
 A database with any row policy (`system.row_policies`, on a table or the whole database) gets no run
-rows at all, because a direct grant would not carry a policy aimed at the binding's role. So a
+rows at all, because a direct grant would not carry a policy aimed at the binding's role, and so does
+a database on which the admin lacks `SHOW ROW POLICIES` (checked with `CHECK GRANT ... ON <db>.*`),
+since a server may hide its policies; ClickHouse Cloud's default user cannot grant it on `system`,
+so `system` gets no run rows there. So a
 direct table grant never reaches past what the binding's role reaches. chauth reads both after every
 passing self-test, so a revoke or a new row policy upstream takes effect for run rows within
 `limits.selfTestInterval` (10m by default); until then the previous read holds.
@@ -216,11 +220,11 @@ The `bindings` field of `connect` lines lists the bindings that gave anything be
 
 Tables are granted to the temp user directly (`SELECT`, `INSERT`, `ALTER UPDATE`, `ALTER DELETE` on
 `<db>.<table>`), never DDL, and go away with the user; the template roles of that database are not
-granted. The admin needs those privileges on `<db>.*` `WITH GRANT OPTION`, `SELECT` only on a
-read-only database, `SELECT` on the listed columns of `system.grants`, `SELECT(database)` on `system.row_policies` and
-`SHOW ROW POLICIES ON *.*`, which the readiness check requires (`CHECK GRANT`) since a server may
-hide policies without it ([upstream
-setup](#upstream-setup)). Every `connect` line logs them as `tables` (`<db>.<table>:<verb>`).
+granted. The admin needs those privileges on `<db>.*` `WITH GRANT OPTION` for each writable
+database, `SELECT ... WITH GRANT OPTION` on each table a read-only database's read role names (never
+`<db>.*`: ClickHouse Cloud cannot grant `system.*`), `SELECT` on the listed columns of
+`system.grants`, `SELECT(database)` on `system.row_policies` and `SHOW ROW POLICIES ON <db>.*` per
+database that should take run tokens ([upstream setup](#upstream-setup)). Every `connect` line logs them as `tables` (`<db>.<table>:<verb>`).
 
 `GET /v1/tables?db=<db>` (or `<instance>/<db>`) with `Authorization: Bearer <token>`: the tables of a
 database the token reaches, with the rows of their active parts; a token limited to tables gets only

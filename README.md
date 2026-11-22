@@ -144,28 +144,32 @@ CREATE USER chauth_admin IDENTIFIED WITH sha256_password BY 'Admin-secret-1';
 GRANT CREATE USER, DROP USER ON chauth_tmp_* TO chauth_admin;
 GRANT chauth_core_read, chauth_core_write, chauth_otel_read, chauth_otel_write, chauth_system_read, chauth_querylog_read TO chauth_admin WITH ADMIN OPTION;
 GRANT SELECT(name, valid_until) ON system.users TO chauth_admin;
--- Run tokens get table privileges directly, only those the binding's role holds; every database in
--- databases needs its line, a read-only one SELECT only.
+-- Run tokens get table privileges directly, only those the binding's role holds: every verb on each
+-- writable database, and on a read-only one SELECT on each table its read role names.
 GRANT SELECT, INSERT, ALTER UPDATE, ALTER DELETE ON core.* TO chauth_admin WITH GRANT OPTION;
 GRANT SELECT, INSERT, ALTER UPDATE, ALTER DELETE ON otel.* TO chauth_admin WITH GRANT OPTION;
-GRANT SELECT ON system.* TO chauth_admin WITH GRANT OPTION;
--- What each role holds, which databases have row policies, and the row estimates of GET /v1/tables.
+GRANT SELECT ON system.parts TO chauth_admin WITH GRANT OPTION;
+GRANT SELECT ON system.settings_changes TO chauth_admin WITH GRANT OPTION;
+-- What each role holds and the row estimates of GET /v1/tables.
 GRANT SELECT(role_name, access_type, database, table, column, is_partial_revoke) ON system.grants TO chauth_admin;
-GRANT SELECT(database) ON system.row_policies TO chauth_admin;
-GRANT SHOW ROW POLICIES ON *.* TO chauth_admin;
 GRANT SELECT(database, table, rows, active) ON system.parts TO chauth_admin;
+-- Row policies per database; a database without this line (system on ClickHouse Cloud) gets no run tokens.
+GRANT SELECT(database) ON system.row_policies TO chauth_admin;
+GRANT SHOW ROW POLICIES ON core.* TO chauth_admin;
+GRANT SHOW ROW POLICIES ON otel.* TO chauth_admin;
 ```
 
 - `CREATE USER, DROP USER ON chauth_tmp_*` lets the admin create and drop only users with the
   temp-user prefix (`tempUserPrefix`).
 - Every role a temp user may get must be granted to the admin `WITH ADMIN OPTION`; a role chauth
   cannot grant keeps the instance not ready.
-- `SELECT, INSERT, ALTER UPDATE, ALTER DELETE ON <db>.* WITH GRANT OPTION` for every database (`SELECT`
-  only on a read-only one) lets chauth grant a run token's declared tables to its temp user directly;
+- `SELECT, INSERT, ALTER UPDATE, ALTER DELETE ON <db>.* WITH GRANT OPTION` for every writable
+  database, and `SELECT ... WITH GRANT OPTION` on each table a read-only database's read role names,
+  let chauth grant a run token's declared tables to its temp user directly;
   the self-test grants them too, so a missing one keeps the instance not ready for every token
   ([authorization details](docs/config.md#authorization-details)).
-- `SELECT(...) ON system.grants`, `SELECT(database) ON system.row_policies` and `SHOW ROW POLICIES`
-  (without which some servers return no policies) let chauth keep a run
+- `SELECT(...) ON system.grants`, `SELECT(database) ON system.row_policies` and `SHOW ROW POLICIES ON
+  <db>.*` per database (without it a database takes no run tokens) let chauth keep a run
   token's verbs to what the binding's role holds and off databases with row policies;
   `SELECT(database, table, rows, active) ON system.parts` gives `GET /v1/tables` its row estimates.
 - Temp-user passwords are 32 random characters with at least two upper-case letters, lower-case

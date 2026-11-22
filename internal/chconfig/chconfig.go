@@ -400,14 +400,22 @@ func (in Instance) GrantableRoles() []string {
 	return slices.Compact(out)
 }
 
-// GrantableTables are the direct privileges a run token can give, as whole-database grants: select
-// on every database, and the write verbs outside readOnlyDatabases. The admin needs them WITH GRANT OPTION.
-func (in Instance) GrantableTables() []rbac.TableGrant {
+// GrantableTables are the direct privileges a run token can give: every verb on each database
+// outside readOnlyDatabases as a whole-database grant, and on a read-only database select on what its
+// read role holds in roleGrants. The admin needs them WITH GRANT OPTION.
+func (in Instance) GrantableTables(roleGrants []rbac.RoleGrant) []rbac.TableGrant {
 	var out []rbac.TableGrant
 	for _, db := range in.Databases {
-		for _, v := range []string{"select", "insert", "update", "delete"} {
-			if v == "select" || !slices.Contains(in.ReadOnlyDatabases, db) {
+		if !slices.Contains(in.ReadOnlyDatabases, db) {
+			for _, v := range []string{"select", "insert", "update", "delete"} {
 				out = append(out, rbac.TableGrant{Database: db, Verb: v})
+			}
+			continue
+		}
+		role := in.RoleFor(db, rbac.Read)
+		for _, g := range roleGrants {
+			if g.Role == role && g.Access == "SELECT" && g.Database == db && !g.Column && !g.PartialRevoke {
+				out = append(out, rbac.TableGrant{Database: db, Table: g.Table, Verb: "select"})
 			}
 		}
 	}
